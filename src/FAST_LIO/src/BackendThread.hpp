@@ -20,13 +20,14 @@ class BackendThread
 private:
     /* data */
     bool isFinished = false;
-    //优化的迭代次数
+    // 优化的迭代次数
     int opt_num;
-    pthread_t pose_backopt;
+    pthread_t pose_backopt_thread;
     pthread_mutex_t opt_finished;
-    //需要优化的位姿
-    vector<ImgOpt*> m_pose_buffer;
-    //某个位姿对应的观测数据，其中位姿buffer和map应是一一对应的
+    pthread_mutex_t pose_modify;
+    // 需要优化的位姿
+    vector<ImgOpt> m_pose_buffer;
+    // 某个位姿对应的观测数据，其中位姿buffer和map应是一一对应的
     std::map<int, vector<goMeas>> m_meas_map;
     static void *multi_thread_ptr(void *arg);
 
@@ -34,16 +35,33 @@ private:
     Eigen::Matrix3d m_matrixIn_eig;
 
 public:
-    BackendThread(vector<ImgOpt*> pose_buffer,int opt_num,std::map<int, vector<goMeas>> meas_map,Eigen::Matrix3d matrixIn_eig);
+    BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, Eigen::Matrix3d matrixIn_eig);
     ~BackendThread();
 
 public:
     void startThread();
     void stopThread();
     bool start_optimize();
+    bool is_finished()
+    {
+        bool finished_flag;
+        pthread_mutex_lock(&opt_finished);
+        finished_flag = isFinished;
+        pthread_mutex_unlock(&opt_finished);
+        return finished_flag;
+    }
+    vector<Isometry3d> get_opt_pose(){
+        int size = m_pose_buffer.size();
+        vector<Isometry3d> cache(size);
+        pthread_mutex_lock(&pose_modify);
+        for(int i=0;i<size;i++){
+            cache[i] = m_pose_buffer[i].lidar_img;
+        }
+        pthread_mutex_unlock(&pose_modify);
+    }
 };
 
-BackendThread::BackendThread(vector<ImgOpt*> pose_buffer,int opt_num,std::map<int, vector<goMeas>> meas_map,Eigen::Matrix3d matrixIn_eig)
+BackendThread::BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, Eigen::Matrix3d matrixIn_eig)
 {
     m_pose_buffer = pose_buffer;
     m_meas_map = meas_map;
@@ -54,21 +72,33 @@ BackendThread::BackendThread(vector<ImgOpt*> pose_buffer,int opt_num,std::map<in
 
 BackendThread::~BackendThread()
 {
-    //是否需要删除位姿内存指针有待商榷
-    m_pose_buffer.clear();
+    // 是否需要删除位姿内存指针有待商榷
+    if(!is_finished()){
+        ROS_ERROR("waiting until current opt thread finished! ---%ld",(long)pose_backopt_thread);
+        pthread_join(pose_backopt_thread,NULL);
+        stopThread();
+    }
+    else{
+        stopThread();
+    }
 }
 
-void BackendThread::startThread(){
-    pthread_mutex_init(&opt_finished,NULL);
-    pthread_create(&pose_backopt,NULL, multi_thread_ptr, (void *)this);
+void BackendThread::startThread()
+{
+    pthread_mutex_init(&opt_finished, NULL);
+    pthread_mutex_init(&pose_modify, NULL);
+    pthread_create(&pose_backopt_thread, NULL, multi_thread_ptr, (void *)this);
     printf("Multi thread started \n");
 }
 
-void BackendThread::stopThread(){
+void BackendThread::stopThread()
+{
     pthread_mutex_destroy(&opt_finished);
+    pthread_mutex_destroy(&pose_modify);
 }
 
-bool BackendThread::start_optimize(){
+bool BackendThread::start_optimize()
+{
     ROS_WARN("Enter");
     typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 1>> BlockSolverType;
     typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>
@@ -88,11 +118,11 @@ bool BackendThread::start_optimize(){
         // g2o::VertexSE3 *v_p = new g2o::VertexSE3();
         g2o::VertexSE3Expmap *v_p = new g2o::VertexSE3Expmap();
         v_p->setId(i);
-        v_p->setEstimate(g2o::SE3Quat(m_pose_buffer[i]->lidar_img.rotation(), m_pose_buffer[i]->lidar_img.translation()));
+        v_p->setEstimate(g2o::SE3Quat(m_pose_buffer[i].lidar_img.rotation(), m_pose_buffer[i].lidar_img.translation()));
 
         optimizer.addVertex(v_p);
     }
-    
+
     int id = 1;
     int no_weight_num;
     for (int i = 0; i < opt_num; i++)
@@ -100,7 +130,7 @@ bool BackendThread::start_optimize(){
         for (goMeas m : m_meas_map.at(i))
         {
             pose_optimize *edge = new pose_optimize();
-            edge->set_paras(m.p_lidar, m_matrixIn_eig(0, 0), m_matrixIn_eig(1, 1), m_matrixIn_eig(0, 2), m_matrixIn_eig(1, 2), &m_pose_buffer[i]->img_ref);
+            edge->set_paras(m.p_lidar, m_matrixIn_eig(0, 0), m_matrixIn_eig(1, 1), m_matrixIn_eig(0, 2), m_matrixIn_eig(1, 2), &m_pose_buffer[i].img_ref);
             g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
             rk->setDelta(1.0);
             edge->setRobustKernel(rk);
@@ -120,23 +150,27 @@ bool BackendThread::start_optimize(){
         }
     }
     ROS_ERROR("BACKEND-------Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!", optimizer.edges().size());
-    
+
     optimizer.initializeOptimization();
     optimizer.optimize(opt_num); // 可以指定优化步数
 
-   
-    
-
-    for(int i=0;i<pose_size;i++){
-        Isometry3d t_cw = static_cast<g2o::VertexSE3Expmap*>(optimizer.vertex(i))->estimate();
-        m_pose_buffer[i]->lidar_img = t_cw;
+    pthread_mutex_lock(&pose_modify);
+    for (int i = 0; i < pose_size; i++)
+    {
+        Isometry3d t_cw = static_cast<g2o::VertexSE3Expmap *>(optimizer.vertex(i))->estimate();
+        m_pose_buffer[i].lidar_img = t_cw;
     }
-    ROS_WARN("Backend Finished Cleanly! Thread-----%ld",(long)pose_backopt);
+    pthread_mutex_unlock(&pose_modify);
+    ROS_WARN("Backend Finished Cleanly! Thread-----%ld", (long)pose_backopt_thread);
+    pthread_mutex_lock(&opt_finished);
     isFinished = true;
+    pthread_mutex_unlock(&opt_finished);
+    pthread_yield();
 }
 
-void * BackendThread::multi_thread_ptr(void *arg){
-    BackendThread* handle = (BackendThread*) arg;
+void *BackendThread::multi_thread_ptr(void *arg)
+{
+    BackendThread *handle = (BackendThread *)arg;
     handle->start_optimize();
     return nullptr;
 }

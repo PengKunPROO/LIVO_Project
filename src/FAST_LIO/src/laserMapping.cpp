@@ -193,6 +193,7 @@ map<int, vector<ImgOpt *>> backend_opt_map;
 ImgStore srcImg;
 vector<vector<int>> color_vector;
 vector<goMeas> opt_meas_buffer;
+vector<BackendThread*> backend_opt_slider;
 cv::Mat matrix_in;
 cv::Mat matrix_out;
 // cv::Mat camera_matrix;
@@ -2284,36 +2285,11 @@ void find_feature_matches(const cv::Mat &img_1, const cv::Mat &img_2,
         }
     }
 }
-vector<g2o::VertexSE3Expmap *> pose_opt(backend_opt_pose_num);
 std::map<int, vector<goMeas>> meas_map;
 void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odom_pub, const ros::Publisher &path_pub)
 {
     meas_map.clear();
     ROS_WARN("Enter");
-    typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 1>> BlockSolverType;
-    typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>
-        LinearSolverType;
-    auto solver = new g2o::OptimizationAlgorithmLevenberg(
-        std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
-
-    g2o::SparseOptimizer optimizer;
-    optimizer.setAlgorithm(solver);
-    optimizer.setVerbose(true);
-    ROS_WARN("Set Opt");
-
-    vector<g2o::VertexSE3Expmap *>().swap(pose_opt);
-    ROS_WARN("Reset Buffer");
-
-    for (int i = 0; i < backend_opt_pose_num; i++)
-    {
-        // g2o::VertexSE3 *v_p = new g2o::VertexSE3();
-        g2o::VertexSE3Expmap *v_p = new g2o::VertexSE3Expmap();
-        v_p->setId(i);
-        v_p->setEstimate(g2o::SE3Quat(backend_buffer[i]->lidar_img.rotation(), backend_buffer[i]->lidar_img.translation()));
-
-        optimizer.addVertex(v_p);
-        pose_opt.push_back(v_p);
-    }
     PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort_filter_out);
     int size = laserCloudFullRes->points.size();
     if (size == 0)
@@ -2335,7 +2311,6 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
     // cv::cvtColor(last_Opt_cache.img_ref, ref_img, cv::COLOR_BGR2GRAY);
 
     int filter_size = size;
-    ROS_ERROR("How many ------%d", filter_size);
     for (int i = 0; i < backend_opt_pose_num; i++)
     {
         vector<goMeas> temp;
@@ -2365,23 +2340,6 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
             int size_tmb = temp_meas_buffer.size();
             for (int k = 0; k < size_tmb; k++)
             {
-                // if (k == i)
-                // {
-                //     continue;
-                // }
-                // Eigen::Vector3d point_cam = backend_buffer[k]->lidar_img * point_world;
-                // if (point_cam(2) == 0)
-                // {
-                //     ROS_ERROR("Error from divide by ZERO! BackEnd Stage!");
-                // }
-                // Eigen::Vector2d pixels = proj3Dto2D(point_cam.x(), point_cam.y(), point_cam.z(), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
-                // float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &backend_buffer[k]->img_ref);
-                // if (gray_temp == -1.0)
-                // {
-                //     ROS_ERROR("Wrong Projection! Skip!");
-                //     continue;
-                // }
-                // //temp.push_back(g2oMeasure(point_world, gray_temp,weight));
                 temp_meas_buffer[k].weight = weight;
                 temp.push_back(temp_meas_buffer[k]);
             }
@@ -2390,114 +2348,15 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
         ROS_WARN("Push %d-th frame mease in buffer,continue! --------%lu", i, temp.size());
         meas_map.insert(std::pair<int, vector<goMeas>>(i, temp));
     }
-    BackendThread* be_pose_opt = new BackendThread(backend_buffer,backend_opt_pose_num,meas_map);
-    int id = 1;
-    int no_weight_num;
-    for (int i = 0; i < backend_opt_pose_num; i++)
-    {
-        for (goMeas m : meas_map.at(i))
-        {
-            pose_optimize *edge = new pose_optimize();
-            edge->set_paras(m.p_lidar, matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2), &backend_buffer[i]->img_ref);
-            g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
-            rk->setDelta(1.0);
-            edge->setRobustKernel(rk);
-            edge->setVertex(0, pose_opt[i]);
-            edge->setMeasurement(m.grayscale);
-            if (m.weight == 0.0 || m.weight == -1.0)
-            {
-                edge->setInformation(Eigen::Matrix<double, 1, 1>::Identity());
-            }
-            else
-            {
-                edge->setInformation(Eigen::Matrix<double, 1, 1>::Identity() * (1 / m.weight));
-            }
-
-            edge->setId(id++);
-            optimizer.addEdge(edge);
-        }
+    //这个变量原本的意义到这里已经用不上了，所以直接赋值，重复利用
+    filter_size = backend_buffer.size();
+    //为了多线程，必须让该对象里面的所有用于优化的数据都是自含的，不然主线程很有可能发生内存泄漏
+    vector<ImgOpt> pose_opt_copy(filter_size);
+    for(int i=0;i<filter_size;i++){
+        pose_opt_copy[i] = ImgOpt(backend_buffer[i]->img_ref.clone(),backend_buffer[i]->lidar_img);
     }
-    ROS_ERROR("BACKEND-------Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!", optimizer.edges().size());
-    // for (int i = 0; i < size; i++)
-    // {
-    //     cv::Mat img_pre = backend_buffer[i]->img_ref;
-    //     for (int j = 0; j < size; j++)
-    //     {
-    //         if (i == j)
-    //         {
-    //             continue;
-    //         }
-    //         else
-    //         {
-    //             cv::Mat img_cur = backend_buffer[j]->img_ref;
-    //             vector<cv::KeyPoint> keypoints_1, keypoints_2;
-    //             vector<cv::DMatch> matches;
-    //             ROS_WARN("Find Featuires Start");
-    //             find_feature_matches(img_pre, img_cur, keypoints_1, keypoints_2, matches);
-    //             ROS_WARN("Find Featuires End");
-
-    //             //-- 估计两张图像间运动
-    //             cv::Mat R, t;
-    //             ROS_WARN("Computer Meas");
-    //             pose_estimation_2d2d(keypoints_1, keypoints_2, matches, R, t);
-    //             ROS_WARN("Computer Meas End");
-    //             // 计算出的R t代表前一个相对于后一个移动了多少，也就是说这个R t是前一个坐标系里的点转换到后一个坐标系的变换矩阵
-    //             Eigen::Matrix<double, 3, 3> R_eigen;
-    //             Eigen::Matrix<double, 3, 1> t_eigen;
-    //             cv::cv2eigen(R, R_eigen);
-    //             cv::cv2eigen(t, t_eigen);
-    //             t_eigen = t_eigen.normalized();
-    //             std::cout << R_eigen << std::endl
-    //                       << t_eigen << std::endl;
-    //             Eigen::Isometry3d meas_T = Eigen::Isometry3d::Identity();
-    //             meas_T.rotate(R_eigen);
-    //             meas_T.pretranslate(t_eigen);
-
-    //             Eigen::Matrix<double, 3, 3> rot_p = backend_buffer[i]->lidar_img.rotation();
-    //             Eigen::Matrix<double, 3, 1> tra_p = backend_buffer[i]->lidar_img.translation();
-
-    //             Eigen::Matrix<double, 3, 3> rot_c = backend_buffer[i + 1]->lidar_img.rotation();
-    //             Eigen::Matrix<double, 3, 1> tra_c = backend_buffer[i + 1]->lidar_img.translation();
-
-    //             Eigen::Matrix<double, 3, 3> deltaR = rot_p.inverse() * rot_c;
-    //             Eigen::Matrix<double, 3, 1> deltap = tra_p - tra_c;
-    //             std::cout << "Meas we computer" << std::endl
-    //                       << deltaR << std::endl
-    //                       << deltap << std::endl;
-    //             g2o::EdgeSE3 *e = new g2o::EdgeSE3();
-    //             e->setId(i);
-
-    //             e->setVertex(0, optimizer.vertices()[i]);
-    //             e->setVertex(1, optimizer.vertices()[j]);
-    //             e->setMeasurement(meas_T);
-    //             optimizer.addEdge(e);
-    //         }
-    //     }
-    // }
-
-    optimizer.initializeOptimization();
-    optimizer.optimize(opt_num_in_one_frame); // 可以指定优化步数
-
-    ROS_WARN("Backend Finished Cleanly!");
-    for (int i = 0; i < backend_opt_pose_num; i++)
-    {
-        Eigen::Isometry3d T_opt = pose_opt[i]->estimate();
-        backend_buffer[i]->lidar_img = T_opt;
-        Eigen::Matrix3d rot_o = T_opt.rotation();
-        Eigen::Vector3d tran_o = T_opt.translation();
-        std::cout << "Opt Result " << std::endl
-                  << "Rotation Backend" << std::endl
-                  << rot_o << std::endl
-                  << "Translation Backend" << std::endl
-                  << tran_o << std::endl;
-        std::cout << "Raw Result " << std::endl
-                  << "Rotation Raw" << std::endl
-                  << backend_buffer[i]->lidar_img.rotation() << std::endl
-                  << "Translation Raw" << std::endl
-                  << backend_buffer[i]->lidar_img.translation() << std::endl;
-        publish_odometry_camera_backend(odom_pub, T_opt);
-        publish_path_interpolate_backend(path_pub, T_opt);
-    }
+    BackendThread* be_pose_opt = new BackendThread(pose_opt_copy,backend_opt_pose_num,meas_map,matrixIn_eig);
+    backend_opt_slider.push_back(be_pose_opt);
 }
 
 void release_vector_with_pointer(vector<ImgOpt *> &buffer)
@@ -2892,7 +2751,27 @@ int main(int argc, char **argv)
                 ROS_WARN("no need to opt,opt paras are not enough!");
             }
             ROS_WARN("opti END!");
-
+            for(int i=0;i<backend_opt_slider.size();i++){
+                if(backend_opt_slider[i]->is_finished()){
+                    vector<Isometry3d> cache_pose = backend_opt_slider[i]->get_opt_pose();
+                    int size = cache_pose.size();
+                    for(int j=0;j<size;j++){
+                        publish_odometry_camera_backend(pubOdomAftMapped_cam,cache_pose[j]);
+                        publish_path_interpolate_backend(pubPath_camera, cache_pose[j]);
+                    }
+                    delete backend_opt_slider[i];
+                    backend_opt_slider[i] = nullptr;
+                }
+            }
+            vector<BackendThread*>::iterator iter_be_slider = backend_opt_slider.begin();
+            while(iter_be_slider!=backend_opt_slider.end()){
+                if((*iter_be_slider)==nullptr){
+                    iter_be_slider = backend_opt_slider.erase(iter_be_slider);
+                }
+                else{
+                    iter_be_slider++;
+                }
+            }
             // publish_odometry_camera(pubOdomAftMapped_cam);
             publish_frame_world_rgb(pubLaserCloudRGBFull);
 
