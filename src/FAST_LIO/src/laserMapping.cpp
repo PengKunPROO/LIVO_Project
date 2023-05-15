@@ -45,6 +45,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
+#include "BackendThread.hpp"
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/Marker.h>
@@ -69,10 +70,16 @@
 #include "pose_optimize.h"
 #include <opencv2/core/eigen.hpp>
 #include <opencv2/highgui/highgui.hpp>
+#include <map>
+#include <thread>
 
 #include "g2o/core/optimization_algorithm_factory.h"
 #include "g2o/core/sparse_optimizer.h"
 #include "g2o/solvers/eigen/linear_solver_eigen.h"
+#include "g2o/core/base_binary_edge.h"
+#include "g2o/core/base_vertex.h"
+#include "g2o/core/robust_kernel_impl.h"
+#include <g2o/types/slam3d/types_slam3d.h>
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
@@ -87,32 +94,15 @@ typedef struct imgStruct
     double timestamp;
 } ImgStore;
 
-typedef struct g2oMeasure
-{
-    g2oMeasure(Eigen::Vector3d p, float gray) : p_lidar(p), grayscale(gray){};
-    Eigen::Vector3d p_lidar;
-    float grayscale;
-} goMeas;
 
-// 不能用指针，因为每一帧我们存储的图像，都会因为Measures的改变而改变，所以图像必须用复制
-// g2o那一块可以用指针，因为那个边只会存在一帧，到下一帧就是新的边了
-typedef struct ImgOptimized
-{
-    ImgOptimized()
-    {
-        img_ref = cv::Mat();
-        lidar_img = Eigen::Isometry3d::Identity();
-    };
-    ImgOptimized(cv::Mat img, Eigen::Isometry3d transform) : img_ref(img), lidar_img(transform){};
-    cv::Mat img_ref;
-    // 这里保存的是如何把你用于优化的雷达那一帧坐标系下的点投影到该帧图像上，所以如果你换了其他雷达帧，就得先转到该雷达帧坐标系下再使用
-    // 我现在先把雷达点转到世界坐标，这样优化的就是世界坐标如何转到相机坐标系的总的R了，之后的投影就直接用这个来做
-    Eigen::Isometry3d lidar_img;
-    // //当前帧雷达坐标系在世界坐标的位置和方向
-    // Eigen::Vector3d lidar_pos_w;
-    // Quaterniond lidar_ori_w;
 
-} ImgOpt;
+typedef struct g2oBackendMeasure
+{
+    g2oBackendMeasure(Eigen::Isometry3d trans) : f_f_trans(trans){};
+    Eigen::Isometry3d f_f_trans;
+} goBM;
+
+
 
 // 存的是我们在插值部分计算的每一帧从当前帧转到产生错位的img对应的lidar坐标系的位姿，每一帧都更新
 Eigen::Isometry3d lidar_OptLidar;
@@ -133,6 +123,8 @@ int invalid_count = 0;
 Eigen::Isometry3d origTcw;
 Eigen::Isometry3d optTcw;
 int valid_orig_count = 0;
+float before_opt_valid_ratio = 0.0;
+float after_opt_valid_ratio = 0.0;
 /***********************/
 
 float res_last[100000] = {0.0};
@@ -154,9 +146,10 @@ double last_timestamp_lidar = 0, last_timestamp_imu = -1.0, last_timestamp_image
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
+double filter_size_camera_opt = 0;
 int effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
 int iterCount = 0, feats_down_size = 0, NUM_MAX_ITERATIONS = 0, laserCloudValidNum = 0, pcd_save_interval = -1, pcd_index = 0;
-int opt_frame_fn = 0;
+int opt_frame_fn = 0, opt_num_in_one_frame = 0, backend_opt_pose_num = 0;
 bool point_selected_surf[100000] = {0};
 bool lidar_pushed, imu_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
@@ -182,6 +175,8 @@ vector<LogVariable> cache_all_log;
 
 vector<double> extrinT(3, 0.0);
 vector<double> extrinR(9, 0.0);
+vector<double> lidar_cam_ext(16, 0.0);
+vector<double> cam_intrinsic(9, 0.0);
 deque<double> time_buffer;
 deque<double> img_time_buffer;
 deque<PointCloudXYZI::Ptr> lidar_buffer;
@@ -189,20 +184,23 @@ deque<PointCloudXYZRGB::Ptr> opt_lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
 deque<ImgStore> img_buffer;
 deque<cv::Mat> img_buffer_pck;
-deque<ImgOpt> multi_opt_buffer;
+deque<ImgOpt *> multi_opt_buffer;
 // 最多只有两张图片放进去，根据两帧的图片进行优化
 deque<cv::Mat> img_optimize_buffer;
+// 当缓存了20帧就开始优化
+map<int, vector<ImgOpt *>> backend_opt_map;
 
 ImgStore srcImg;
 vector<vector<int>> color_vector;
 vector<goMeas> opt_meas_buffer;
 cv::Mat matrix_in;
 cv::Mat matrix_out;
-cv::Mat camera_matrix;
-cv::Mat distortion_coef;
+// cv::Mat camera_matrix;
+// cv::Mat distortion_coef;
 Eigen::Matrix3d matrixIn_eig;
 Eigen::Matrix<double, 3, 4> matrixOut_eig;
 Eigen::Isometry3d lidar_cam = Eigen::Isometry3d::Identity();
+Eigen::Isometry3d before_opt_Tcw = Eigen::Isometry3d::Identity();
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -212,6 +210,10 @@ PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr _featsArray;
+// 经过深度过滤的点云，采用同一区域深度最小的点放入优化过程
+PointCloudXYZI::Ptr feats_undistort_filter(new PointCloudXYZI());
+PointCloudXYZI::Ptr feats_undistort_filter_out(new PointCloudXYZI());
+PointCloudXYZI::Ptr feats_undistort_world(new PointCloudXYZI());
 
 PointCloudXYZRGB::Ptr cloudRGB(new PointCloudXYZRGB());
 PointCloudXYZRGB::Ptr cloudRGBTemp(new PointCloudXYZRGB());
@@ -247,7 +249,7 @@ shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 ImgStore initialImg;
-ImgOpt last_Opt_cache;
+// ImgOpt last_Opt_cache;
 double firstLidarFrame;
 
 void SigHandle(int sig)
@@ -276,6 +278,18 @@ inline void dump_lio_state_to_log(FILE *fp)
 inline void log3DPoint(Eigen::Vector3d point)
 {
     std::cout << "x: " << point(0) << " y: " << point(1) << " z: " << point(2) << std::endl;
+}
+
+inline bool isOverlap(Eigen::Vector3d p1, Eigen::Vector3d p2)
+{
+    double r2 = filter_size_camera_opt * filter_size_camera_opt;
+    // 因为livox的坐标系x轴是向外的，所以以y-z平面的距离构成半径判断，而深度x用于找到离我们最近的物体表面
+    if (powl(p1.x() - p2.x(), 2) + powl(p1.y() - p2.y(), 2) <= r2)
+    {
+        return true;
+    }
+
+    return false;
 }
 
 // 返回世界坐标点转换到当前雷达局部坐标系的变换矩阵
@@ -308,6 +322,13 @@ inline float getGrayScaleInImg(float u, float v, cv::Mat *img)
     }
     gray = (float)img->at<uchar>(cvRound(u), cvRound(v));
     return gray;
+}
+
+inline cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
+{
+    cv::Mat img;
+    img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
+    return img;
 }
 
 void pointBodyToWorld_ikfom(PointType const *const pi, PointType *const po, state_ikfom &s)
@@ -404,7 +425,7 @@ void getOriginalCoordByTransMatrix(Quaterniond &rot, Eigen::Vector3d &ori, Eigen
 
     Eigen::Vector3d orig_body(0, 0, 0);
     ori = transMatrix.inverse() * orig_body;
-    rot = Quaterniond(transMatrix.rotation());
+    rot = Quaterniond(transMatrix.rotation().inverse());
     rot.normalize();
 }
 
@@ -540,13 +561,6 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     sig_buffer.notify_all();
 }
 
-cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
-{
-    cv::Mat img;
-    img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
-    return img;
-}
-
 int isFirst = 1;
 void img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
@@ -554,17 +568,17 @@ void img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
     if (msg_in->header.stamp.toSec() < last_timestamp_image)
     {
         ROS_ERROR("img loop back,clear buffer");
-        img_buffer.clear();
+        img_buffer_pck.clear();
         img_time_buffer.clear();
     }
 
     mtx_buffer.lock();
 
-    initialImg.name = msg_in->header.frame_id;
-    initialImg.img_data = getImageFromMsg(msg_in);
-    initialImg.timestamp = msg_in->header.stamp.toSec();
-    img_buffer.push_back(initialImg);
-    img_buffer_pck.push_back(initialImg.img_data);
+    // initialImg.name = msg_in->header.frame_id;
+    // initialImg.img_data = getImageFromMsg(msg_in);
+    // initialImg.timestamp = msg_in->header.stamp.toSec();
+
+    img_buffer_pck.push_back(getImageFromMsg(msg_in));
     img_time_buffer.push_back(msg_in->header.stamp.toSec());
     last_timestamp_image = msg_in->header.stamp.toSec();
     ROS_INFO("get img at  %lf", msg_in->header.stamp.toSec());
@@ -699,6 +713,7 @@ bool sync_packages_img(MeasureGroup &meas)
         else
         {
             imu_pushed = false;
+            lidar_pushed = false;
             ROS_INFO("IMU SYNC FAILED!");
             return false;
         }
@@ -738,7 +753,7 @@ bool sync_packages_img(MeasureGroup &meas)
         }
 
         double img_start_time = img_time_buffer.front();
-        meas.img_offset_time = -1;
+        meas.img_offset_time = -1.0;
         ROS_INFO("img start time at %lf,lidar end time at %lf", img_start_time, lidar_end_time);
         mtx_buffer.lock();
         while ((!img_buffer_pck.empty()) && img_start_time < lidar_end_time)
@@ -750,6 +765,8 @@ bool sync_packages_img(MeasureGroup &meas)
                 ROS_INFO("this img start time = %lf || this lidar frame end time = %lf", img_start_time, lidar_end_time);
                 img_buffer_pck.pop_front();
                 img_time_buffer.pop_front();
+                // 在这里也要更新一下，不然下次依然是上一个没pop的time，继续进，如果遇到time buffer里面和上一个img time相差很大的，就会出错
+                img_start_time = img_time_buffer.front();
                 continue;
             }
             meas.img = img_buffer_pck.front();
@@ -761,7 +778,7 @@ bool sync_packages_img(MeasureGroup &meas)
         }
         mtx_buffer.unlock();
         sig_buffer.notify_all();
-        if (meas.img_offset_time == -1)
+        if (meas.img_offset_time == -1.0)
         {
             return false;
         }
@@ -1186,7 +1203,7 @@ void publish_frame_world_rgb(const ros::Publisher &pubLaserCloudFull)
     for (int i = 0; i < size; i++)
     {
         Eigen::Vector3d p_world(cloudRGBWorld->points[i].x, cloudRGBWorld->points[i].y, cloudRGBWorld->points[i].z);
-        Eigen::Vector3d temp = multi_opt_buffer.back().lidar_img * p_world;
+        Eigen::Vector3d temp = multi_opt_buffer.back()->lidar_img * p_world;
         Eigen::Vector2d uv = proj3Dto2D(temp(0), temp(1), temp(2), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
         cache_opt_uv.push_back(cv::Point2f(uv(0), uv(1)));
         if (uv(0) < 0 || uv(0) > src_img.cols || uv(1) < 0 || uv(1) > src_img.rows)
@@ -1194,6 +1211,7 @@ void publish_frame_world_rgb(const ros::Publisher &pubLaserCloudFull)
             invalid_count++;
         }
     }
+    after_opt_valid_ratio = (float)invalid_count / (float)size;
     std::cout << "Invalid count is " << invalid_count << std::endl;
     if (frame_map_to_save >= 0)
     {
@@ -1261,7 +1279,7 @@ void publish_frame_body_rgb(const ros::Publisher &pubLaserCloudFull_body)
     }
 
     // PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
+    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort_filter_out);
     int size = laserCloudFullRes->points.size();
     ROS_INFO("------------------- %d", size);
     // 此时已经得到了两帧之间的插值，那么肯定是转回前一帧
@@ -1297,122 +1315,6 @@ void publish_frame_body_rgb(const ros::Publisher &pubLaserCloudFull_body)
         }
     }
     ROS_INFO("Finish saving the data ");
-    if (initial_frame)
-    {
-        // 第一帧就用第一次雷达的位姿
-        initial_frame = false;
-        currentCamerPose.pose.pose.orientation.w = odomAftMapped.pose.pose.orientation.w;
-        currentCamerPose.pose.pose.orientation.x = odomAftMapped.pose.pose.orientation.x;
-        currentCamerPose.pose.pose.orientation.y = odomAftMapped.pose.pose.orientation.y;
-        currentCamerPose.pose.pose.orientation.z = odomAftMapped.pose.pose.orientation.z;
-        currentCamerPose.pose.pose.position.x = odomAftMapped.pose.pose.position.x;
-        currentCamerPose.pose.pose.position.y = odomAftMapped.pose.pose.position.y;
-        currentCamerPose.pose.pose.position.z = odomAftMapped.pose.pose.position.z;
-        deltaQ = Quaterniond::Identity();
-        deltaPos = V3D(0, 0, 0);
-        odomCache_msg = odomAftMapped;
-        last_Opt_cache.img_ref = src_img.clone();
-        // 第一帧加入图片,然后tcw不变，在第二帧再重新赋值，因为第一帧计算不出来tcw
-        optTcw = Eigen::Isometry3d::Identity();
-        if (multi_opt_buffer.size() == 0)
-        {
-            cv::Mat temp;
-            cv::cvtColor(src_img, temp, cv::COLOR_BGR2GRAY);
-            multi_opt_buffer.push_back(ImgOpt(temp.clone(), Eigen::Isometry3d::Identity()));
-            ROS_WARN("First Frame Img add to multi_opt_buffer!");
-            cv::imwrite("/opt/log_img/bodypub/src_img_" + to_string(times_pub) + ".jpg", src_img);
-            cv::imwrite("/opt/log_img/bodypub/gray_img_" + to_string(times_pub) + ".jpg", temp);
-        }
-    }
-    else
-    {
-        double t1 = odomCache_msg.header.stamp.toSec();
-        ROS_INFO("last lidar frame time is  :%lf", t1);
-        double t2 = odomAftMapped.header.stamp.toSec();
-        ROS_INFO("current lidar frame time is  :%lf", t2);
-
-        double t = Measures.img_offset_time + Measures.lidar_beg_time;
-        ROS_INFO("current IMG frame time is  :%lf", t);
-
-        currentCamerPose = odomAftInterpolation(t, t1, t2, odomCache_msg, odomAftMapped);
-        ROS_INFO("o1: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", odomCache_msg.pose.pose.orientation.w,
-                 odomCache_msg.pose.pose.orientation.x, odomCache_msg.pose.pose.orientation.y, odomCache_msg.pose.pose.orientation.z,
-                 odomCache_msg.pose.pose.position.x, odomCache_msg.pose.pose.position.y, odomCache_msg.pose.pose.position.z);
-        ROS_INFO("lerp: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", currentCamerPose.pose.pose.orientation.w,
-                 currentCamerPose.pose.pose.orientation.x, currentCamerPose.pose.pose.orientation.y, currentCamerPose.pose.pose.orientation.z,
-                 currentCamerPose.pose.pose.position.x, currentCamerPose.pose.pose.position.y, currentCamerPose.pose.pose.position.z);
-        ROS_INFO("o2: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", odomAftMapped.pose.pose.orientation.w,
-                 odomAftMapped.pose.pose.orientation.x, odomAftMapped.pose.pose.orientation.y, odomAftMapped.pose.pose.orientation.z,
-                 odomAftMapped.pose.pose.position.x, odomAftMapped.pose.pose.position.y, odomAftMapped.pose.pose.position.z);
-
-        // 计算插值的和当前帧的角度差，就是deltaQ，即 deltaQ*q1 = q2，所以 deltaQ = q2*q1.conjugate
-        // 这里转换坐标依然需要对deltaQ取反，因为是 camera->next lidar frame
-        Quaterniond q1 = convertRos2Eigen(currentCamerPose);
-        q1.normalize();
-        Quaterniond q2 = convertRos2Eigen(odomAftMapped);
-        q2.normalize();
-        deltaQ = q2 * q1.conjugate();
-        deltaQ.normalize();
-        // 注意，这里计算的是从插值帧的pos移到后一帧点云之间的距离，是插值->点云，所以如果是把插值坐标转到点云坐标系，需要取反
-        deltaPos = convertRos2EigenVector(odomCache_msg) - convertRos2EigenVector(currentCamerPose);
-        Eigen::Isometry3d temp = Eigen::Isometry3d::Identity();
-        temp.rotate(deltaQ.toRotationMatrix());
-        temp.translate(deltaPos);
-        lidar_OptLidar = temp;
-        // world->current body->simulate lidar pos->current cam
-        Eigen::Isometry3d frame_trans = lidar_cam * temp * b2w_get().inverse();
-        // 平常的帧，在pub body这阶段存的只是该帧的初始值，即用来去优化的
-        cv::Mat temp_gray_img;
-        cv::cvtColor(src_img, temp_gray_img, cv::COLOR_BGR2GRAY);
-        multi_opt_buffer.push_back(ImgOpt(temp_gray_img.clone(), frame_trans));
-        cv::imwrite("/opt/log_img/bodypub/src_img_" + to_string(times_pub) + ".jpg", src_img);
-        cv::imwrite("/opt/log_img/bodypub/gray_img_" + to_string(times_pub) + ".jpg", temp_gray_img);
-        if (times_pub == 1)
-        {
-            std::cout << "pub stage proj" << std::endl;
-            std::cout << "Quaternion" << deltaQ << std::endl;
-            std::cout << "Translation" << deltaPos << std::endl;
-        }
-        // 对ImgOpt的初始化
-        if (times_pub == 1)
-        {
-            ROS_INFO("initial last opt cam pose");
-            Quaterniond q1 = convertRos2Eigen(odomCache_msg);
-            q1.normalize();
-            std::cout << "cache stage q1: " << q1 << std::endl;
-            Quaterniond q2 = convertRos2Eigen(odomAftMapped);
-            q2.normalize();
-            std::cout << "cache stage q2: " << q1 << std::endl;
-            Quaterniond deltaQ_ = q2 * q1.conjugate();
-            deltaQ_.normalize();
-            std::cout << "(Quaternion)ext's of frame-frame shift-" << std::endl;
-            std::cout << deltaQ_ << std::endl;
-            V3D deltaP = convertRos2EigenVector(odomCache_msg) - convertRos2EigenVector(odomAftMapped);
-            std::cout << "(Translation)ext's of frame-frame shift-" << std::endl;
-            std::cout << deltaP << std::endl;
-            std::cout << "preframe: " << convertRos2EigenVector(odomCache_msg) << std::endl;
-            std::cout << "currentframe: " << convertRos2EigenVector(odomAftMapped) << std::endl;
-            Eigen::Isometry3d lidar_initial_lidar = Eigen::Isometry3d::Identity();
-            lidar_initial_lidar.rotate(deltaQ_.toRotationMatrix());
-            lidar_initial_lidar.pretranslate(deltaP);
-
-            std::cout << "ext's of frame-frame shift" << std::endl;
-            std::cout << lidar_initial_lidar.matrix() << std::endl;
-
-            // 这个result相当于是一个body坐标系的雷达点转到前一帧（第一帧）的坐标系然后再结合外参转到摄像机坐标系
-            Eigen::Isometry3d result = lidar_cam * lidar_initial_lidar;
-            std::cout << "result" << std::endl;
-            std::cout << result.matrix() << std::endl;
-            last_Opt_cache.lidar_img = result;
-            // 此时在第二帧，把第一帧的值赋给multi_opt_buffer
-            // 要注意，给第一帧的也得是world->cam的变换，所以这个得统一，先world->body，再body->cam
-
-            // 这里存的转换body_2_world其实是世界坐标的一个点转到第二帧雷达自身坐标系
-            // 到第二帧，第一帧的参数才真正设置完，在之后的优化中就可以使用第一帧的lidar_img了
-            multi_opt_buffer[0].lidar_img = result * b2w_get().inverse();
-        }
-        odomCache_msg = odomAftMapped;
-    }
 
     //-----------------验证l2 frame的代码插在这个下面-------------------------//
 
@@ -1424,12 +1326,7 @@ void publish_frame_body_rgb(const ros::Publisher &pubLaserCloudFull_body)
     cloudRGB->height = 1;
     cloudRGB->width = size; // get the point number of lidar data
     cloudRGB->points.resize(size);
-    // for (int i = 0; i < size; i++)
-    // {
-    //     RGBPoint_body2slerpBody(&cloudRGB->points[i], &cloudRGB->points[i], deltaPos, deltaQ);
-    //     // std::cout<<"world pos =("<<cloudRGBWorld->points[i].x<<","<<cloudRGBWorld->points[i].y<<","<<cloudRGBWorld->points[i].z<<","<<cloudRGBWorld->points[i].r<<","<<cloudRGBWorld->points[i].g<<")";
-    //     // ROS_INFO_STREAM("world pos =("<<cloudRGBWorld->points[i].x<<","<<cloudRGBWorld->points[i].y<<","<<cloudRGBWorld->points[i].z<<","<<cloudRGBWorld->points[i].r<<","<<cloudRGBWorld->points[i].g<<")");
-    // }
+
     std::vector<cv::Point2f>().swap(cache_lidar_2_img);
     cv::Mat circle_img = src_img.clone();
     // PointCloudT::Ptr cloudRGBTemp(new PointCloudT);
@@ -1454,6 +1351,7 @@ void publish_frame_body_rgb(const ros::Publisher &pubLaserCloudFull_body)
         cloudRGBTemp->push_back(cloudRGB->points[i]);
         cache_lidar_2_img.push_back(cv::Point2f(UV[0], UV[1]));
     }
+    before_opt_valid_ratio = (float)valid_orig_count / (float)size;
     if (cache_lidar_2_img.size() == 0)
     {
         ROS_INFO("In %d-th pub,no point porjected onto corresponding IMG", times_pub);
@@ -1482,19 +1380,6 @@ void publish_frame_body_rgb(const ros::Publisher &pubLaserCloudFull_body)
         // std::cout<<"world pos =("<<cloudRGBWorld->points[i].x<<","<<cloudRGBWorld->points[i].y<<","<<cloudRGBWorld->points[i].z<<","<<cloudRGBWorld->points[i].r<<","<<cloudRGBWorld->points[i].g<<")";
         // ROS_INFO_STREAM("world pos =("<<cloudRGBWorld->points[i].x<<","<<cloudRGBWorld->points[i].y<<","<<cloudRGBWorld->points[i].z<<","<<cloudRGBWorld->points[i].r<<","<<cloudRGBWorld->points[i].g<<")");
     }
-    // for (int i = 0; i < size; i++)
-    // {
-    //     getColor(deltaQ, deltaPos, matrix_in, matrix_out, (&cloudRGBWorld->points[i])->x, (&cloudRGBWorld->points[i])->y, (&cloudRGBWorld->points[i])->z, row, col, color_vector, RGB);
-    //     if (RGB[0] == 0 && RGB[1] == 0 && RGB[2] == 0)
-    //     {
-    //         // ROS_INFO("WHITE COLOR!");
-    //         a_count++;
-    //         continue;
-    //     }
-    //     cloudRGBWorld->points[i].r = RGB[0];
-    //     cloudRGBWorld->points[i].g = RGB[1];
-    //     cloudRGBWorld->points[i].b = RGB[2];
-    // }
 
     ROS_INFO("This pub has %d white color but we have %d points in one scan!", valid_orig_count, size);
     sensor_msgs::PointCloud2 laserCloudmsg;
@@ -1595,6 +1480,47 @@ void set_posestamp_camera(T &out, Eigen::Quaterniond rot, Eigen::Vector3d pose)
     out.pose.orientation.w = rot.w();
 }
 
+void publish_odometry_camera_backend(const ros::Publisher &pubOdomAftMapped, Eigen::Isometry3d &opt_T)
+{
+    ROS_INFO("==================PUBLIC CAM ODOMETRY START==================");
+    odomAftMapped_cam.header.frame_id = "camera_init";
+    odomAftMapped_cam.child_frame_id = "bodys";
+    odomAftMapped_cam.header.stamp = ros::Time().fromSec(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+
+    Eigen::Quaterniond rot_temp;
+    Eigen::Vector3d trans_temp;
+
+    getOriginalCoordByTransMatrix(rot_temp, trans_temp, opt_T);
+
+    set_posestamp_camera(odomAftMapped_cam.pose, rot_temp, trans_temp);
+    pubOdomAftMapped.publish(odomAftMapped_cam);
+
+    // auto P = kf.get_P();
+    // for (int i = 0; i < 6; i++)
+    // {
+    //     int k = i < 3 ? i + 3 : i - 3;
+    //     odomAftMapped.pose.covariance[i * 6 + 0] = P(k, 3);
+    //     odomAftMapped.pose.covariance[i * 6 + 1] = P(k, 4);
+    //     odomAftMapped.pose.covariance[i * 6 + 2] = P(k, 5);
+    //     odomAftMapped.pose.covariance[i * 6 + 3] = P(k, 0);
+    //     odomAftMapped.pose.covariance[i * 6 + 4] = P(k, 1);
+    //     odomAftMapped.pose.covariance[i * 6 + 5] = P(k, 2);
+    // }
+    static tf::TransformBroadcaster br;
+    tf::Transform transform_s;
+    tf::Quaternion q_s;
+    transform_s.setOrigin(tf::Vector3(odomAftMapped_cam.pose.pose.position.x,
+                                      odomAftMapped_cam.pose.pose.position.y,
+                                      odomAftMapped_cam.pose.pose.position.z));
+    q_s.setW(odomAftMapped_cam.pose.pose.orientation.w);
+    q_s.setX(odomAftMapped_cam.pose.pose.orientation.x);
+    q_s.setY(odomAftMapped_cam.pose.pose.orientation.y);
+    q_s.setZ(odomAftMapped_cam.pose.pose.orientation.z);
+    transform_s.setRotation(q_s);
+    br.sendTransform(tf::StampedTransform(transform_s, odomAftMapped_cam.header.stamp, "camera_init", "bodys"));
+    ROS_INFO("==================PUBLIC CAM ODOMETRY END==================");
+}
+
 void publish_odometry_camera(const ros::Publisher &pubOdomAftMapped)
 {
     ROS_INFO("==================PUBLIC CAM ODOMETRY START==================");
@@ -1605,7 +1531,7 @@ void publish_odometry_camera(const ros::Publisher &pubOdomAftMapped)
     Eigen::Quaterniond rot_temp;
     Eigen::Vector3d trans_temp;
 
-    getOriginalCoordByTransMatrix(rot_temp, trans_temp, multi_opt_buffer.back().lidar_img);
+    getOriginalCoordByTransMatrix(rot_temp, trans_temp, multi_opt_buffer.back()->lidar_img);
 
     set_posestamp_camera(odomAftMapped_cam.pose, rot_temp, trans_temp);
     pubOdomAftMapped.publish(odomAftMapped_cam);
@@ -1673,7 +1599,7 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped)
     ROS_INFO("==================PUBLIC ODOMETRY END==================");
 }
 
-void publish_path(const ros::Publisher pubPath)
+void publish_path(const ros::Publisher &pubPath)
 {
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -1689,12 +1615,12 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
-void publish_path_interpolate(const ros::Publisher pubPath)
+void publish_path_interpolate_backend(const ros::Publisher &pubPath, Eigen::Isometry3d &opt_T)
 {
     Eigen::Quaterniond rot_temp;
     Eigen::Vector3d trans_temp;
 
-    getOriginalCoordByTransMatrix(rot_temp, trans_temp, multi_opt_buffer.back().lidar_img);
+    getOriginalCoordByTransMatrix(rot_temp, trans_temp, opt_T);
 
     set_posestamp_camera(msg_body_pose_camera, rot_temp, trans_temp);
     msg_body_pose_camera.header.stamp = ros::Time().fromSec(lidar_end_time);
@@ -1704,6 +1630,27 @@ void publish_path_interpolate(const ros::Publisher pubPath)
     static int kkk = 0;
     kkk++;
     if (kkk % 10 == 0)
+    {
+        path_camera.poses.push_back(msg_body_pose_camera);
+        pubPath.publish(path_camera);
+    }
+}
+
+void publish_path_interpolate(const ros::Publisher &pubPath)
+{
+    Eigen::Quaterniond rot_temp;
+    Eigen::Vector3d trans_temp;
+
+    getOriginalCoordByTransMatrix(rot_temp, trans_temp, multi_opt_buffer.back()->lidar_img);
+
+    set_posestamp_camera(msg_body_pose_camera, rot_temp, trans_temp);
+    msg_body_pose_camera.header.stamp = ros::Time().fromSec(lidar_end_time);
+    msg_body_pose_camera.header.frame_id = "camera_init";
+
+    /*** if path is too large, the rvis will crash ***/
+    static int kkk = 0;
+    kkk++;
+    if (kkk % 1 == 0)
     {
         path_camera.poses.push_back(msg_body_pose_camera);
         pubPath.publish(path_camera);
@@ -1902,7 +1849,11 @@ bool poseEstimation(const vector<goMeas> &measurements, cv::Mat *img, Eigen::Mat
 
     for (goMeas m : measurements)
     {
-        pose_optimize *edge = new pose_optimize(m.p_lidar, K(0, 0), K(1, 1), K(0, 2), K(1, 2), img);
+        pose_optimize *edge = new pose_optimize();
+        edge->set_paras(m.p_lidar, K(0, 0), K(1, 1), K(0, 2), K(1, 2), img);
+        g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+        rk->setDelta(1.0);
+        edge->setRobustKernel(rk);
         edge->setVertex(0, pose);
         edge->setMeasurement(m.grayscale);
         edge->setInformation(Eigen::Matrix<double, 1, 1>::Identity());
@@ -1912,7 +1863,7 @@ bool poseEstimation(const vector<goMeas> &measurements, cv::Mat *img, Eigen::Mat
     ROS_ERROR("Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!", optimer.edges().size());
     optimer.initializeOptimization();
     ROS_ERROR("Edges initialization success!");
-    optimer.optimize(30);
+    optimer.optimize(opt_num_in_one_frame);
     Tcw = pose->estimate();
     std::cout << "Tcw aft Optimized" << std::endl;
     std::cout << Tcw.matrix() << std::endl;
@@ -1938,13 +1889,18 @@ Eigen::Isometry3d optimize_photometric(int index)
     Tcw = lidar_cam * lidar_OptLidar * body_2_world.inverse();
     std::cout << "Tcw before Optimized(previous)" << std::endl;
     std::cout << Tcw.matrix() << std::endl;
-    Tcw = multi_opt_buffer.back().lidar_img;
+    Tcw = multi_opt_buffer.back()->lidar_img;
+    before_opt_Tcw = Tcw;
     std::cout << "Tcw before Optimized(now)" << std::endl;
     std::cout << Tcw.matrix() << std::endl;
 
     origTcw = Tcw;
-    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort);
+    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort_filter_out);
     int size = laserCloudFullRes->points.size();
+    if (size == 0)
+    {
+        ROS_ERROR("No points in opt_stage after filtering process,check Function \"process_pcl_by_depth\" or lidar-cam Translation Matrix");
+    }
     PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
     std::vector<g2oMeasure>().swap(opt_meas_buffer);
 
@@ -1967,21 +1923,33 @@ Eigen::Isometry3d optimize_photometric(int index)
     // // cv::cvtColor(img_optimize_buffer.front(), ref_img, cv::COLOR_BGR2GRAY);
     // cv::cvtColor(last_Opt_cache.img_ref, ref_img, cv::COLOR_BGR2GRAY);
 
-    int filter_size = size / 10;
+    int filter_size = size;
     for (int i = 0; i < filter_size; i++)
     {
         Eigen::Vector3d point_world(laserCloudWorld->points[i].x, laserCloudWorld->points[i].y, laserCloudWorld->points[i].z);
 
         for (int j = 0; j < multi_opt_buffer.size() - 1; j++)
         {
-            Eigen::Vector3d point_cam = multi_opt_buffer[j].lidar_img * point_world;
-            Eigen::Vector2d pixels = proj3Dto2D(point_cam.x(), point_cam.y(), point_cam.z(), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
-            float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &multi_opt_buffer[j].img_ref);
-            if (gray_temp == -1.0)
+            Eigen::Vector3d point_cam = multi_opt_buffer[j]->lidar_img * point_world;
+            // ROS_INFO_STREAM("CamPoint _____" << point_cam);
+            if (point_cam(2) == 0)
             {
+                ROS_ERROR("Error from divide by ZERO!");
+            }
+            Eigen::Vector2d pixels = proj3Dto2D(point_cam.x(), point_cam.y(), point_cam.z(), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
+            // ROS_INFO_STREAM("Pixels _______" << pixels);
+            if (multi_opt_buffer[j]->img_ref.empty())
+            {
+                ROS_ERROR("Img Cache is wrong,check img topic!!!");
                 continue;
             }
-            opt_meas_buffer.push_back(g2oMeasure(point_world, gray_temp));
+            float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &multi_opt_buffer[j]->img_ref);
+            if (gray_temp == -1.0)
+            {
+                ROS_ERROR("Wrong Projection! Skip!");
+                continue;
+            }
+            opt_meas_buffer.push_back(g2oMeasure(point_world, gray_temp, -1.0));
             if (i == 0 && j == 0)
             {
                 std::cout << "in opt stage we porj 1st point to the img of multi_buffer.front()" << std::endl;
@@ -2000,7 +1968,7 @@ Eigen::Isometry3d optimize_photometric(int index)
         //     opt_meas_buffer.push_back(g2oMeasure(point_world, getGrayScaleInImg(pixels(0), pixels(1), &ref_img)));
     }
     ROS_WARN("pose estimation launch!");
-    if (poseEstimation(opt_meas_buffer, &multi_opt_buffer.back().img_ref, matrixIn_eig, Tcw))
+    if (poseEstimation(opt_meas_buffer, &multi_opt_buffer.back()->img_ref, matrixIn_eig, Tcw))
     {
         ROS_WARN("pose estimation SUCCESSED!");
     }
@@ -2022,6 +1990,526 @@ Eigen::Isometry3d optimize_photometric(int index)
     return Tcw;
 }
 
+void process_pcl_by_depth(PointCloudXYZI::Ptr pcl_in, PointCloudXYZI::Ptr pcl_out)
+{
+    // 先转到camera coord再映射到图像上，存三维点映射到二维点的关系，然后在二维点过滤，之后把深度对比一下，那么我觉得可以直接存
+    // 但这个用不到后面优化环节，优化环节还是需要原来的三维点，因为你的二维点是投在这一帧上的，所以只能在这过滤了
+    int size = pcl_in->points.size();
+    std::cout << "Before filter PCL_IN size is " << size << std::endl;
+    // 前两个是像素坐标，后一个是该像素的深度值
+    vector<Eigen::Vector3d> uv_map;
+    PointCloudXYZI::Ptr pcl_in_world(new PointCloudXYZI(size, 1));
+    if (size == 1)
+    {
+        pcl_out->points.push_back(pcl_in->points.front());
+        pcl_in->erase(pcl_in->begin());
+        return;
+    }
+    for (int i = 0; i < size; i++)
+    {
+        RGBpointBodyToWorld(&pcl_in->points[i], &pcl_in_world->points[i]);
+    }
+    // 先投到相机坐标系，用这一帧的初始值投，只能这样了
+    PointCloudXYZI::iterator sync_pcl_in = pcl_in_world->begin();
+    for (auto iter_p = pcl_in->begin(); iter_p != pcl_in->end();)
+    {
+        Eigen::Vector3d world_p(sync_pcl_in->x, sync_pcl_in->y, sync_pcl_in->z);
+        Eigen::Vector3d temp = multi_opt_buffer.back()->lidar_img * world_p;
+        Eigen::Vector2d uv = proj3Dto2D(temp(0), temp(1), temp(2), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
+        if (uv(0) < 0 || uv(0) > Measures.img.cols || uv(1) < 0 || uv(1) > Measures.img.rows)
+        {
+            iter_p = pcl_in->erase(iter_p);
+            sync_pcl_in = pcl_in_world->erase(sync_pcl_in);
+        }
+        else
+        {
+            uv_map.push_back(Eigen::Vector3d(uv(0), uv(1), temp(2)));
+            iter_p++;
+            sync_pcl_in++;
+        }
+    }
+    std::cout << "PCL_IN SIZE BEFORE FILTER " << pcl_in->points.size() << std::endl;
+    std::cout << "PCL_IN_WORLD SIZE BEFORE FILTER " << pcl_in_world->points.size() << std::endl;
+    std::cout << "UV_MAP SIZE BEFORE FILTER " << uv_map.size() << std::endl;
+    while (!pcl_in->points.empty())
+    {
+        Eigen::Vector3d begin = uv_map.front();
+        PointType begin_p = pcl_in->front();
+        vector<Eigen::Vector3d>::iterator iter = uv_map.begin();
+        PointCloudXYZI::iterator iter_p = pcl_in->begin();
+        iter_p = iter_p + 1;
+        for (iter = iter + 1; iter != uv_map.end();)
+        {
+            if (isOverlap(*iter, begin))
+            {
+                if (iter->z() <= begin.z())
+                {
+                    // 因为两个iter是同步的，所以当被筛选的uv判定重合时就可以判定其的第三个元素，如果小于被比较的，则替换，然后两个同时删除该iter指向的元素
+                    // 然后进行下一个
+                    begin = *iter;
+                    begin_p = *iter_p;
+                    iter = uv_map.erase(iter);
+                    iter_p = pcl_in->erase(iter_p);
+                }
+                else
+                {
+                    iter = uv_map.erase(iter);
+                    iter_p = pcl_in->erase(iter_p);
+                }
+            }
+            else
+            {
+                iter++;
+                iter_p++;
+            }
+        }
+        iter = uv_map.begin();
+        iter_p = pcl_in->begin();
+        pcl_out->points.push_back(begin_p);
+        pcl_in->erase(iter_p);
+        uv_map.erase(iter);
+    }
+    std::cout << "Size after filter" << pcl_out->points.size() << std::endl;
+}
+
+void cache_camera_odometry_paras()
+{
+    cv::Mat src_img = Measures.img;
+    if (initial_frame)
+    {
+        // 第一帧就用第一次雷达的位姿
+        initial_frame = false;
+        currentCamerPose.pose.pose.orientation.w = odomAftMapped.pose.pose.orientation.w;
+        currentCamerPose.pose.pose.orientation.x = odomAftMapped.pose.pose.orientation.x;
+        currentCamerPose.pose.pose.orientation.y = odomAftMapped.pose.pose.orientation.y;
+        currentCamerPose.pose.pose.orientation.z = odomAftMapped.pose.pose.orientation.z;
+        currentCamerPose.pose.pose.position.x = odomAftMapped.pose.pose.position.x;
+        currentCamerPose.pose.pose.position.y = odomAftMapped.pose.pose.position.y;
+        currentCamerPose.pose.pose.position.z = odomAftMapped.pose.pose.position.z;
+        deltaQ = Quaterniond::Identity();
+        deltaPos = V3D(0, 0, 0);
+        odomCache_msg = odomAftMapped;
+        // last_Opt_cache.img_ref = src_img.clone();
+        // 第一帧加入图片,然后tcw不变，在第二帧再重新赋值，因为第一帧计算不出来tcw
+        optTcw = Eigen::Isometry3d::Identity();
+        if (multi_opt_buffer.size() == 0)
+        {
+            cv::Mat temp;
+            cv::cvtColor(src_img, temp, cv::COLOR_BGR2GRAY);
+            ImgOpt *temp_pointer = new ImgOpt(temp.clone(), Eigen::Isometry3d::Identity());
+            multi_opt_buffer.push_back(temp_pointer);
+            temp_pointer = nullptr;
+            ROS_WARN("First Frame Img add to multi_opt_buffer!");
+            cv::imwrite("/opt/log_img/bodypub/src_img_" + to_string(times_pub) + ".jpg", src_img);
+            cv::imwrite("/opt/log_img/bodypub/gray_img_" + to_string(times_pub) + ".jpg", temp);
+        }
+    }
+    else
+    {
+        double t1 = odomCache_msg.header.stamp.toSec();
+        ROS_INFO("last lidar frame time is  :%lf", t1);
+        double t2 = odomAftMapped.header.stamp.toSec();
+        ROS_INFO("current lidar frame time is  :%lf", t2);
+        double t = Measures.img_offset_time + Measures.lidar_beg_time;
+        ROS_INFO("current IMG frame time is  :%lf", t);
+
+        currentCamerPose = odomAftInterpolation(t, t1, t2, odomCache_msg, odomAftMapped);
+        ROS_INFO("o1: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", odomCache_msg.pose.pose.orientation.w,
+                 odomCache_msg.pose.pose.orientation.x, odomCache_msg.pose.pose.orientation.y, odomCache_msg.pose.pose.orientation.z,
+                 odomCache_msg.pose.pose.position.x, odomCache_msg.pose.pose.position.y, odomCache_msg.pose.pose.position.z);
+        ROS_INFO("lerp: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", currentCamerPose.pose.pose.orientation.w,
+                 currentCamerPose.pose.pose.orientation.x, currentCamerPose.pose.pose.orientation.y, currentCamerPose.pose.pose.orientation.z,
+                 currentCamerPose.pose.pose.position.x, currentCamerPose.pose.pose.position.y, currentCamerPose.pose.pose.position.z);
+        ROS_INFO("o2: w:%lf,x:%lf,y:%lf,z:%lf || position: x:%lf,y:%lf,z:%lf", odomAftMapped.pose.pose.orientation.w,
+                 odomAftMapped.pose.pose.orientation.x, odomAftMapped.pose.pose.orientation.y, odomAftMapped.pose.pose.orientation.z,
+                 odomAftMapped.pose.pose.position.x, odomAftMapped.pose.pose.position.y, odomAftMapped.pose.pose.position.z);
+
+        // 计算插值的和当前帧的角度差，就是deltaQ，即 deltaQ*q1 = q2，所以 deltaQ = q2*q1.conjugate
+        // 这里转换坐标依然需要对deltaQ取反，因为是 camera->next lidar frame
+        Quaterniond q1 = convertRos2Eigen(currentCamerPose);
+        q1.normalize();
+        Quaterniond q2 = convertRos2Eigen(odomAftMapped);
+        q2.normalize();
+        deltaQ = q2 * q1.conjugate();
+        deltaQ.normalize();
+        // 注意，这里计算的是从插值帧的pos移到后一帧点云之间的距离，是插值->点云，所以如果是把插值坐标转到点云坐标系，需要取反
+        deltaPos = convertRos2EigenVector(odomCache_msg) - convertRos2EigenVector(currentCamerPose);
+        Eigen::Isometry3d temp = Eigen::Isometry3d::Identity();
+        temp.rotate(deltaQ.toRotationMatrix());
+        temp.translate(deltaPos);
+        lidar_OptLidar = temp;
+        // world->current body->simulate lidar pos->current cam
+        Eigen::Isometry3d frame_trans = lidar_cam * temp * b2w_get().inverse();
+        // 平常的帧，在pub body这阶段存的只是该帧的初始值，即用来去优化的
+        cv::Mat temp_gray_img;
+        cv::cvtColor(src_img, temp_gray_img, cv::COLOR_BGR2GRAY);
+        ImgOpt *temp_pointer = new ImgOpt(temp_gray_img.clone(), frame_trans);
+        multi_opt_buffer.push_back(temp_pointer);
+        temp_pointer = nullptr;
+        // 对ImgOpt的初始化
+        if (times_pub == 1)
+        {
+            ROS_INFO("initial last opt cam pose");
+            Quaterniond q1 = convertRos2Eigen(odomCache_msg);
+            q1.normalize();
+            std::cout << "cache stage q1: " << q1 << std::endl;
+            Quaterniond q2 = convertRos2Eigen(odomAftMapped);
+            q2.normalize();
+            std::cout << "cache stage q2: " << q1 << std::endl;
+            Quaterniond deltaQ_ = q2 * q1.conjugate();
+            deltaQ_.normalize();
+            std::cout << "(Quaternion)ext's of frame-frame shift-" << std::endl;
+            std::cout << deltaQ_ << std::endl;
+            V3D deltaP = convertRos2EigenVector(odomCache_msg) - convertRos2EigenVector(odomAftMapped);
+            std::cout << "(Translation)ext's of frame-frame shift-" << std::endl;
+            std::cout << deltaP << std::endl;
+            std::cout << "preframe: " << convertRos2EigenVector(odomCache_msg) << std::endl;
+            std::cout << "currentframe: " << convertRos2EigenVector(odomAftMapped) << std::endl;
+            Eigen::Isometry3d lidar_initial_lidar = Eigen::Isometry3d::Identity();
+            lidar_initial_lidar.rotate(deltaQ_.toRotationMatrix());
+            lidar_initial_lidar.pretranslate(deltaP);
+
+            std::cout << "ext's of frame-frame shift" << std::endl;
+            std::cout << lidar_initial_lidar.matrix() << std::endl;
+
+            // 这个result相当于是一个body坐标系的雷达点转到前一帧（第一帧）的坐标系然后再结合外参转到摄像机坐标系
+            Eigen::Isometry3d result = lidar_cam * lidar_initial_lidar;
+            std::cout << "result" << std::endl;
+            std::cout << result.matrix() << std::endl;
+            // last_Opt_cache.lidar_img = result;
+            // 此时在第二帧，把第一帧的值赋给multi_opt_buffer
+            // 要注意，给第一帧的也得是world->cam的变换，所以这个得统一，先world->body，再body->cam
+
+            // 这里存的转换body_2_world其实是世界坐标的一个点转到第二帧雷达自身坐标系
+            // 到第二帧，第一帧的参数才真正设置完，在之后的优化中就可以使用第一帧的lidar_img了
+            multi_opt_buffer[0]->lidar_img = result * b2w_get().inverse();
+        }
+        odomCache_msg = odomAftMapped;
+    }
+}
+
+void pose_estimation_2d2d(std::vector<cv::KeyPoint> keypoints_1,
+                          std::vector<cv::KeyPoint> keypoints_2,
+                          std::vector<cv::DMatch> matches,
+                          cv::Mat &R, cv::Mat &t)
+{
+    // 相机内参,TUM Freiburg2
+    cv::Mat K = matrix_in;
+
+    //-- 把匹配点转换为vector<Point2f>的形式
+    vector<cv::Point2f> points1;
+    vector<cv::Point2f> points2;
+
+    for (int i = 0; i < (int)matches.size(); i++)
+    {
+        points1.push_back(keypoints_1[matches[i].queryIdx].pt);
+        points2.push_back(keypoints_2[matches[i].trainIdx].pt);
+    }
+
+    // //-- 计算基础矩阵
+    // cv::Mat fundamental_matrix;
+    // fundamental_matrix = cv::findFundamentalMat ( points1, points2, cv::FM_8POINT );
+    // cout<<"fundamental_matrix is "<<endl<< fundamental_matrix<<endl;
+
+    //-- 计算本质矩阵
+    cv::Point2d principal_point(matrixIn_eig(0, 2), matrixIn_eig(1, 2));
+    double focal_length = matrixIn_eig(1, 1);
+    cv::Mat essential_matrix;
+    essential_matrix = cv::findEssentialMat(points1, points2, focal_length, principal_point);
+    cout << "essential_matrix is " << endl
+         << essential_matrix << endl;
+
+    // //-- 计算单应矩阵
+    // cv::Mat homography_matrix;
+    // homography_matrix = cv::findHomography ( points1, points2, cv::RANSAC, 3 );
+    // cout<<"homography_matrix is "<<endl<<homography_matrix<<endl;
+
+    //-- 从本质矩阵中恢复旋转和平移信息.
+    cv::recoverPose(essential_matrix, points1, points2, R, t, focal_length, principal_point);
+    std::cout << "R is " << std::endl
+              << R << std::endl;
+    std::cout << "t is " << std::endl
+              << t << std::endl;
+}
+
+void find_feature_matches(const cv::Mat &img_1, const cv::Mat &img_2,
+                          std::vector<cv::KeyPoint> &keypoints_1,
+                          std::vector<cv::KeyPoint> &keypoints_2,
+                          std::vector<cv::DMatch> &matches)
+{
+    //-- 初始化
+    cv::Mat descriptors_1, descriptors_2;
+    // used in OpenCV3
+    cv::Ptr<cv::FeatureDetector> detector = cv::ORB::create();
+    cv::Ptr<cv::DescriptorExtractor> descriptor = cv::ORB::create();
+    // use this if you are in OpenCV2
+    // Ptr<FeatureDetector> detector = FeatureDetector::create ( "ORB" );
+    // Ptr<DescriptorExtractor> descriptor = DescriptorExtractor::create ( "ORB" );
+    cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create("BruteForce-Hamming");
+    //-- 第一步:检测 Oriented FAST 角点位置
+    detector->detect(img_1, keypoints_1);
+    detector->detect(img_2, keypoints_2);
+
+    //-- 第二步:根据角点位置计算 BRIEF 描述子
+    descriptor->compute(img_1, keypoints_1, descriptors_1);
+    descriptor->compute(img_2, keypoints_2, descriptors_2);
+
+    //-- 第三步:对两幅图像中的BRIEF描述子进行匹配，使用 Hamming 距离
+    vector<cv::DMatch> match;
+    // BFMatcher matcher ( NORM_HAMMING );
+    matcher->match(descriptors_1, descriptors_2, match);
+
+    //-- 第四步:匹配点对筛选
+    double min_dist = 10000, max_dist = 0;
+
+    // 找出所有匹配之间的最小距离和最大距离, 即是最相似的和最不相似的两组点之间的距离
+    for (int i = 0; i < descriptors_1.rows; i++)
+    {
+        double dist = match[i].distance;
+        if (dist < min_dist)
+            min_dist = dist;
+        if (dist > max_dist)
+            max_dist = dist;
+    }
+
+    printf("-- Max dist : %f \n", max_dist);
+    printf("-- Min dist : %f \n", min_dist);
+
+    // 当描述子之间的距离大于两倍的最小距离时,即认为匹配有误.但有时候最小距离会非常小,设置一个经验值30作为下限.
+    for (int i = 0; i < descriptors_1.rows; i++)
+    {
+        if (match[i].distance <= max(2 * min_dist, 30.0))
+        {
+            matches.push_back(match[i]);
+        }
+    }
+}
+vector<g2o::VertexSE3Expmap *> pose_opt(backend_opt_pose_num);
+std::map<int, vector<goMeas>> meas_map;
+void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odom_pub, const ros::Publisher &path_pub)
+{
+    meas_map.clear();
+    ROS_WARN("Enter");
+    typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 1>> BlockSolverType;
+    typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>
+        LinearSolverType;
+    auto solver = new g2o::OptimizationAlgorithmLevenberg(
+        std::make_unique<BlockSolverType>(std::make_unique<LinearSolverType>()));
+
+    g2o::SparseOptimizer optimizer;
+    optimizer.setAlgorithm(solver);
+    optimizer.setVerbose(true);
+    ROS_WARN("Set Opt");
+
+    vector<g2o::VertexSE3Expmap *>().swap(pose_opt);
+    ROS_WARN("Reset Buffer");
+
+    for (int i = 0; i < backend_opt_pose_num; i++)
+    {
+        // g2o::VertexSE3 *v_p = new g2o::VertexSE3();
+        g2o::VertexSE3Expmap *v_p = new g2o::VertexSE3Expmap();
+        v_p->setId(i);
+        v_p->setEstimate(g2o::SE3Quat(backend_buffer[i]->lidar_img.rotation(), backend_buffer[i]->lidar_img.translation()));
+
+        optimizer.addVertex(v_p);
+        pose_opt.push_back(v_p);
+    }
+    PointCloudXYZI::Ptr laserCloudFullRes(feats_undistort_filter_out);
+    int size = laserCloudFullRes->points.size();
+    if (size == 0)
+    {
+        ROS_ERROR("No points in opt_stage after filtering process,check Function \"process_pcl_by_depth\" or lidar-cam Translation Matrix");
+    }
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+    std::vector<g2oMeasure>().swap(opt_meas_buffer);
+
+    // let all points transformed to world frame
+    for (int i = 0; i < size; i++)
+    {
+        RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+    }
+    // Eigen::Vector3d point_pixel(laserCloudFullRes->points[0].x, laserCloudFullRes->points[0].y, laserCloudFullRes->points[0].z);
+    // Eigen::Vector3d point_world(laserCloudWorld->points[0].x, laserCloudWorld->points[0].y, laserCloudWorld->points[0].z);
+    // cv::Mat ref_img;
+    // // cv::cvtColor(img_optimize_buffer.front(), ref_img, cv::COLOR_BGR2GRAY);
+    // cv::cvtColor(last_Opt_cache.img_ref, ref_img, cv::COLOR_BGR2GRAY);
+
+    int filter_size = size;
+    ROS_ERROR("How many ------%d", filter_size);
+    for (int i = 0; i < backend_opt_pose_num; i++)
+    {
+        vector<goMeas> temp;
+        for (int j = 0; j < filter_size; j++)
+        {
+            Eigen::Vector3d point_world(laserCloudWorld->points[j].x, laserCloudWorld->points[j].y, laserCloudWorld->points[j].z);
+            float weight = 0;
+            vector<goMeas> temp_meas_buffer;
+            for (int k = 0; k < backend_opt_pose_num; k++)
+            {
+                if (k == i)
+                {
+                    continue;
+                }
+                Eigen::Vector3d point_cam = backend_buffer[k]->lidar_img * point_world;
+                Eigen::Vector2d pixels = proj3Dto2D(point_cam.x(), point_cam.y(), point_cam.z(), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
+                float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &backend_buffer[k]->img_ref);
+                if (gray_temp == -1.0)
+                {
+                    ROS_ERROR("Wrong Projection! Skip!");
+                    continue;
+                }
+                // 以点是否与优化帧共视作为权重
+                weight += 1.0;
+                temp_meas_buffer.push_back(goMeas(point_world, gray_temp, -1.0));
+            }
+            int size_tmb = temp_meas_buffer.size();
+            for (int k = 0; k < size_tmb; k++)
+            {
+                // if (k == i)
+                // {
+                //     continue;
+                // }
+                // Eigen::Vector3d point_cam = backend_buffer[k]->lidar_img * point_world;
+                // if (point_cam(2) == 0)
+                // {
+                //     ROS_ERROR("Error from divide by ZERO! BackEnd Stage!");
+                // }
+                // Eigen::Vector2d pixels = proj3Dto2D(point_cam.x(), point_cam.y(), point_cam.z(), matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2));
+                // float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &backend_buffer[k]->img_ref);
+                // if (gray_temp == -1.0)
+                // {
+                //     ROS_ERROR("Wrong Projection! Skip!");
+                //     continue;
+                // }
+                // //temp.push_back(g2oMeasure(point_world, gray_temp,weight));
+                temp_meas_buffer[k].weight = weight;
+                temp.push_back(temp_meas_buffer[k]);
+            }
+        }
+        // 第0个就是第0帧需要的观测数据
+        ROS_WARN("Push %d-th frame mease in buffer,continue! --------%lu", i, temp.size());
+        meas_map.insert(std::pair<int, vector<goMeas>>(i, temp));
+    }
+    BackendThread* be_pose_opt = new BackendThread(backend_buffer,backend_opt_pose_num,meas_map);
+    int id = 1;
+    int no_weight_num;
+    for (int i = 0; i < backend_opt_pose_num; i++)
+    {
+        for (goMeas m : meas_map.at(i))
+        {
+            pose_optimize *edge = new pose_optimize();
+            edge->set_paras(m.p_lidar, matrixIn_eig(0, 0), matrixIn_eig(1, 1), matrixIn_eig(0, 2), matrixIn_eig(1, 2), &backend_buffer[i]->img_ref);
+            g2o::RobustKernelHuber *rk = new g2o::RobustKernelHuber;
+            rk->setDelta(1.0);
+            edge->setRobustKernel(rk);
+            edge->setVertex(0, pose_opt[i]);
+            edge->setMeasurement(m.grayscale);
+            if (m.weight == 0.0 || m.weight == -1.0)
+            {
+                edge->setInformation(Eigen::Matrix<double, 1, 1>::Identity());
+            }
+            else
+            {
+                edge->setInformation(Eigen::Matrix<double, 1, 1>::Identity() * (1 / m.weight));
+            }
+
+            edge->setId(id++);
+            optimizer.addEdge(edge);
+        }
+    }
+    ROS_ERROR("BACKEND-------Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!", optimizer.edges().size());
+    // for (int i = 0; i < size; i++)
+    // {
+    //     cv::Mat img_pre = backend_buffer[i]->img_ref;
+    //     for (int j = 0; j < size; j++)
+    //     {
+    //         if (i == j)
+    //         {
+    //             continue;
+    //         }
+    //         else
+    //         {
+    //             cv::Mat img_cur = backend_buffer[j]->img_ref;
+    //             vector<cv::KeyPoint> keypoints_1, keypoints_2;
+    //             vector<cv::DMatch> matches;
+    //             ROS_WARN("Find Featuires Start");
+    //             find_feature_matches(img_pre, img_cur, keypoints_1, keypoints_2, matches);
+    //             ROS_WARN("Find Featuires End");
+
+    //             //-- 估计两张图像间运动
+    //             cv::Mat R, t;
+    //             ROS_WARN("Computer Meas");
+    //             pose_estimation_2d2d(keypoints_1, keypoints_2, matches, R, t);
+    //             ROS_WARN("Computer Meas End");
+    //             // 计算出的R t代表前一个相对于后一个移动了多少，也就是说这个R t是前一个坐标系里的点转换到后一个坐标系的变换矩阵
+    //             Eigen::Matrix<double, 3, 3> R_eigen;
+    //             Eigen::Matrix<double, 3, 1> t_eigen;
+    //             cv::cv2eigen(R, R_eigen);
+    //             cv::cv2eigen(t, t_eigen);
+    //             t_eigen = t_eigen.normalized();
+    //             std::cout << R_eigen << std::endl
+    //                       << t_eigen << std::endl;
+    //             Eigen::Isometry3d meas_T = Eigen::Isometry3d::Identity();
+    //             meas_T.rotate(R_eigen);
+    //             meas_T.pretranslate(t_eigen);
+
+    //             Eigen::Matrix<double, 3, 3> rot_p = backend_buffer[i]->lidar_img.rotation();
+    //             Eigen::Matrix<double, 3, 1> tra_p = backend_buffer[i]->lidar_img.translation();
+
+    //             Eigen::Matrix<double, 3, 3> rot_c = backend_buffer[i + 1]->lidar_img.rotation();
+    //             Eigen::Matrix<double, 3, 1> tra_c = backend_buffer[i + 1]->lidar_img.translation();
+
+    //             Eigen::Matrix<double, 3, 3> deltaR = rot_p.inverse() * rot_c;
+    //             Eigen::Matrix<double, 3, 1> deltap = tra_p - tra_c;
+    //             std::cout << "Meas we computer" << std::endl
+    //                       << deltaR << std::endl
+    //                       << deltap << std::endl;
+    //             g2o::EdgeSE3 *e = new g2o::EdgeSE3();
+    //             e->setId(i);
+
+    //             e->setVertex(0, optimizer.vertices()[i]);
+    //             e->setVertex(1, optimizer.vertices()[j]);
+    //             e->setMeasurement(meas_T);
+    //             optimizer.addEdge(e);
+    //         }
+    //     }
+    // }
+
+    optimizer.initializeOptimization();
+    optimizer.optimize(opt_num_in_one_frame); // 可以指定优化步数
+
+    ROS_WARN("Backend Finished Cleanly!");
+    for (int i = 0; i < backend_opt_pose_num; i++)
+    {
+        Eigen::Isometry3d T_opt = pose_opt[i]->estimate();
+        backend_buffer[i]->lidar_img = T_opt;
+        Eigen::Matrix3d rot_o = T_opt.rotation();
+        Eigen::Vector3d tran_o = T_opt.translation();
+        std::cout << "Opt Result " << std::endl
+                  << "Rotation Backend" << std::endl
+                  << rot_o << std::endl
+                  << "Translation Backend" << std::endl
+                  << tran_o << std::endl;
+        std::cout << "Raw Result " << std::endl
+                  << "Rotation Raw" << std::endl
+                  << backend_buffer[i]->lidar_img.rotation() << std::endl
+                  << "Translation Raw" << std::endl
+                  << backend_buffer[i]->lidar_img.translation() << std::endl;
+        publish_odometry_camera_backend(odom_pub, T_opt);
+        publish_path_interpolate_backend(path_pub, T_opt);
+    }
+}
+
+void release_vector_with_pointer(vector<ImgOpt *> &buffer)
+{
+    int size = buffer.size();
+    for (int i = 0; i < size; i++)
+    {
+        delete buffer[i];
+        buffer[i] = nullptr;
+    }
+}
+
 int main(int argc, char **argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -2040,6 +2528,7 @@ int main(int argc, char **argv)
     nh.param<double>("filter_size_corner", filter_size_corner_min, 0.5);
     nh.param<double>("filter_size_surf", filter_size_surf_min, 0.5);
     nh.param<double>("filter_size_map", filter_size_map_min, 0.5);
+    nh.param<double>("filter_size_camera_opt", filter_size_camera_opt, 0.5);
     nh.param<double>("cube_side_length", cube_len, 200);
     nh.param<float>("mapping/det_range", DET_RANGE, 300.f);
     nh.param<double>("mapping/fov_degree", fov_deg, 180);
@@ -2054,6 +2543,8 @@ int main(int argc, char **argv)
     nh.param<int>("preprocess/scan_rate", p_pre->SCAN_RATE, 10);
     nh.param<int>("point_filter_num", p_pre->point_filter_num, 2);
     nh.param<int>("common/opt_frame_fn", opt_frame_fn, 2);
+    nh.param<int>("common/opt_num_in_one_frame", opt_num_in_one_frame, 20);
+    nh.param<int>("common/backend_opt_pose_num", backend_opt_pose_num, 10);
     nh.param<bool>("feature_extract_enable", p_pre->feature_enabled, false);
     nh.param<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
     nh.param<bool>("mapping/extrinsic_est_en", extrinsic_est_en, true);
@@ -2061,6 +2552,8 @@ int main(int argc, char **argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    nh.param<vector<double>>("mapping/cam_lidar_ext", lidar_cam_ext, vector<double>());
+    nh.param<vector<double>>("mapping/cam_intrinsic", cam_intrinsic, vector<double>());
 
     nh.param<int>("publish/frame_num_to_stop", frame_num_to_stop, 20);
     nh.param<int>("publish/frame_map_to_save", frame_map_to_save, 20);
@@ -2095,41 +2588,48 @@ int main(int argc, char **argv)
     0.988403 0.0785745 0.129945 -0.178752
     0 0 0 1
     */
+    /*
+    -0.040507,-0.998998,-0.019029,0.163793
+    0.0388064,0.0174573,-0.999094,0.0762877
+    0.998425,-0.0412087,0.0380603,-0.438607
+    0,0,0,1
+    */
     //---------camera parameters-----------//
-    std::vector<double> intrinsic = {817.846, 0, 1000.37, 0, 835.075, 551.246, 0, 0, 1};
+    // std::vector<double> intrinsic = {817.846, 0, 1000.37, 0, 835.075, 551.246, 0, 0, 1};
     std::vector<double> distortion = {-0.2658, 0.0630, 0.0026, 0.0015, 0};
-    std::vector<double> extrinsic = {-0.00589083, -0.99976, -0.0211195, 0.0221539, -0.0232254, 0.021251, -0.999504, 0.0745742, 0.999713, -0.0053974, -0.023345, 0.675224, 0, 0, 0, 1};
+    // std::vector<double> extrinsic = {-0.040507, -0.998998, -0.019029, 0.163793, 0.0388064, 0.0174573, -0.999094, 0.0762877, 0.998425, -0.0412087, 0.0380603, -0.438607, 0, 0, 0, 1};
     // std::vector<double> extrinsic = {0.0771635, -0.996892, 0.0158657, -0.175356,
     //                                  0.130788, -0.00565472, -0.991394, -0.243168,
     //                                  0.988403, 0.0785742, 0.129945, -0.178752, 0, 0, 0, 1};
-    double matrix1[3][3] = {{intrinsic[0], intrinsic[1], intrinsic[2]}, {intrinsic[3], intrinsic[4], intrinsic[5]}, {intrinsic[6], intrinsic[7], intrinsic[8]}};
-    double matrix2[3][4] = {{extrinsic[0], extrinsic[1], extrinsic[2], extrinsic[3]}, {extrinsic[4], extrinsic[5], extrinsic[6], extrinsic[7]}, {extrinsic[8], extrinsic[9], extrinsic[10], extrinsic[11]}};
+
+    double matrix1[3][3] = {{cam_intrinsic[0], cam_intrinsic[1], cam_intrinsic[2]}, {cam_intrinsic[3], cam_intrinsic[4], cam_intrinsic[5]}, {cam_intrinsic[6], cam_intrinsic[7], cam_intrinsic[8]}};
+    double matrix2[3][4] = {{lidar_cam_ext[0], lidar_cam_ext[1], lidar_cam_ext[2], lidar_cam_ext[3]}, {lidar_cam_ext[4], lidar_cam_ext[5], lidar_cam_ext[6], lidar_cam_ext[7]}, {lidar_cam_ext[8], lidar_cam_ext[9], lidar_cam_ext[10], lidar_cam_ext[11]}};
 
     matrix_in = cv::Mat(3, 3, CV_64F, matrix1);
     matrix_out = cv::Mat(3, 4, CV_64F, matrix2);
 
     cv::cv2eigen(matrix_in, matrixIn_eig);
     cv::cv2eigen(matrix_out, matrixOut_eig);
-    std::cout << matrixOut_eig.matrix() << std::endl;
+
     /*lidar_cam isometry3d matrix initialization*/
     Eigen::Matrix3d rotation_part = matrixOut_eig.block<3, 3>(0, 0);
     Eigen::Vector3d translation_part = matrixOut_eig.block<3, 1>(0, 3);
     lidar_cam.rotate(rotation_part);
     lidar_cam.pretranslate(translation_part);
     // set intrinsic parameters of the camera
-    camera_matrix = cv::Mat::eye(3, 3, CV_64F);
-    camera_matrix.at<double>(0, 0) = intrinsic[0];
-    camera_matrix.at<double>(0, 2) = intrinsic[2];
-    camera_matrix.at<double>(1, 1) = intrinsic[4];
-    camera_matrix.at<double>(1, 2) = intrinsic[5];
+    // camera_matrix = cv::Mat::eye(3, 3, CV_64F);
+    // camera_matrix.at<double>(0, 0) = intrinsic[0];
+    // camera_matrix.at<double>(0, 2) = intrinsic[2];
+    // camera_matrix.at<double>(1, 1) = intrinsic[4];
+    // camera_matrix.at<double>(1, 2) = intrinsic[5];
 
-    // set radial distortion and tangential distortion
-    distortion_coef = cv::Mat::zeros(5, 1, CV_64F);
-    distortion_coef.at<double>(0, 0) = distortion[0];
-    distortion_coef.at<double>(1, 0) = distortion[1];
-    distortion_coef.at<double>(2, 0) = distortion[2];
-    distortion_coef.at<double>(3, 0) = distortion[3];
-    distortion_coef.at<double>(4, 0) = distortion[4];
+    // // set radial distortion and tangential distortion
+    // distortion_coef = cv::Mat::zeros(5, 1, CV_64F);
+    // distortion_coef.at<double>(0, 0) = distortion[0];
+    // distortion_coef.at<double>(1, 0) = distortion[1];
+    // distortion_coef.at<double>(2, 0) = distortion[2];
+    // distortion_coef.at<double>(3, 0) = distortion[3];
+    // distortion_coef.at<double>(4, 0) = distortion[4];
 
     Lidar_T_wrt_IMU << VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU << MAT_FROM_ARRAY(extrinR);
@@ -2179,6 +2679,7 @@ int main(int argc, char **argv)
     // ros::Duration(8).sleep();
     bool status = ros::ok();
     int index_stop = 0;
+    bool once = true;
     while (status)
     {
         if (flg_exit)
@@ -2210,6 +2711,7 @@ int main(int argc, char **argv)
             // after feats_undistort pass through the Process function,it contains all the pcl with respected to the i-th scan lidar frame(10 HZ)
             p_imu->Process(Measures, kf, feats_undistort);
             ROS_INFO("after process,points size is :%lu", feats_undistort->points.size());
+
             state_point = kf.get_x();
             // IMU坐标系下的lidar位置
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
@@ -2227,6 +2729,7 @@ int main(int argc, char **argv)
                 ROS_WARN("No point, skip this scan!\n");
                 continue;
             }
+
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? false : true;
             /*** Segment the map in lidar FOV ***/
             lasermap_fov_segment();
@@ -2316,7 +2819,12 @@ int main(int argc, char **argv)
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
+            // 该函数把优化过程比如插值或者要缓存的参数都包括在内，每帧运行一次
+            cache_camera_odometry_paras();
 
+            pcl::copyPointCloud(*feats_undistort, *feats_undistort_filter);
+            feats_undistort_filter_out->clear();
+            process_pcl_by_depth(feats_undistort_filter, feats_undistort_filter_out);
             /******* Publish points *******/
             if (path_en)
             {
@@ -2338,26 +2846,45 @@ int main(int argc, char **argv)
                 publish_frame_body(pubLaserCloudFull_body);
                 publish_frame_body_rgb(pubLaserCloudFull_body_rgb);
             }
-
+            // 声明成临时变量了，因为多线程情况一个while循环的时间执行不了20帧的后端优化
+            vector<ImgOpt *> backend_buffer;
             // 当帧数小于opt_frame_fn时采用两两之间优化，当达到时采用所有的一起优化
             Eigen::Isometry3d lidar_cams;
             if (multi_opt_buffer.size() <= opt_frame_fn && multi_opt_buffer.size() > 1)
             {
-                if (last_Opt_cache.img_ref.empty())
-                {
-                    ROS_WARN("not cache the last optimized result in ImgOpt Struct!");
-                }
+                // if (last_Opt_cache.img_ref.empty())
+                // {
+                //     ROS_WARN("not cache the last optimized result in ImgOpt Struct!");
+                // }
                 if (times_pub > 1)
                 {
                     ROS_WARN("optimize enter!");
                     lidar_cams = optimize_photometric(0);
                 }
-                last_Opt_cache.img_ref = Measures.img.clone();
-                last_Opt_cache.lidar_img = lidar_cams;
-                multi_opt_buffer.back() = ImgOpt(last_Opt_cache.img_ref.clone(), last_Opt_cache.lidar_img);
+                // last_Opt_cache.img_ref = Measures.img.clone();
+                // last_Opt_cache.lidar_img = lidar_cams;
+                multi_opt_buffer.back()->lidar_img = lidar_cams;
+                // 传进去的指针会重新开辟内存，所以只需要专注该内存内容的管理即可
+                // 由于没有使用智能指针，所以只能重新开辟内存，放入backend_buffer中
+                ImgOpt *opt_element_be = new ImgOpt(multi_opt_buffer.back()->img_ref.clone(), multi_opt_buffer.back()->lidar_img);
+                backend_buffer.push_back(opt_element_be);
+                // 禁止发生内存访问重复，设置为空比较安全
+                opt_element_be = nullptr;
+
                 if (multi_opt_buffer.size() >= opt_frame_fn)
                 {
+                    delete multi_opt_buffer.front();
+                    multi_opt_buffer.front() = nullptr;
                     multi_opt_buffer.pop_front();
+                }
+
+                if (backend_buffer.size() >= backend_opt_pose_num)
+                {
+                    ROS_WARN("Backend Opt Start!");
+                    
+                    pose_opt_backend(backend_buffer, pubOdomAftMapped_cam, pubPath_camera);
+                    release_vector_with_pointer(backend_buffer);
+                    vector<ImgOpt *>().swap(backend_buffer);
                 }
             }
             else
@@ -2365,10 +2892,11 @@ int main(int argc, char **argv)
                 ROS_WARN("no need to opt,opt paras are not enough!");
             }
             ROS_WARN("opti END!");
-            publish_odometry_camera(pubOdomAftMapped_cam);
+
+            // publish_odometry_camera(pubOdomAftMapped_cam);
             publish_frame_world_rgb(pubLaserCloudRGBFull);
 
-            publish_path_interpolate(pubPath_camera);
+            // publish_path_interpolate(pubPath_camera);
 
             geometry_msgs::Quaternion temp_q = odomAftMapped.pose.pose.orientation;
             geometry_msgs::Point temp_t = odomAftMapped.pose.pose.position;
@@ -2376,11 +2904,11 @@ int main(int argc, char **argv)
             Eigen::Vector3d ei_t;
             Eigen::Quaterniond opt_ei_q;
             Eigen::Vector3d opt_ei_t;
-            getOriginalCoordByTransMatrix(opt_ei_q, opt_ei_t, multi_opt_buffer.back().lidar_img);
-            getOriginalCoordByTransMatrix(ei_q, ei_t, optTcw);
+            getOriginalCoordByTransMatrix(opt_ei_q, opt_ei_t, multi_opt_buffer.back()->lidar_img);
+            getOriginalCoordByTransMatrix(ei_q, ei_t, before_opt_Tcw);
             LogVariable cur_frame_log = LogVariable(Measures.lidar_end_time, cloudRGBTemp->points.size(), invalid_count, valid_orig_count, optTcw, origTcw,
-                                                    ei_q, ei_t, opt_ei_q, opt_ei_t);
-            cache_all_log.push_back(cur_frame_log);
+                                                    ei_q, ei_t, opt_ei_q, opt_ei_t, after_opt_valid_ratio, before_opt_valid_ratio);
+            // cache_all_log.push_back(cur_frame_log);
             //
             //
             index_stop++;
@@ -2390,6 +2918,18 @@ int main(int argc, char **argv)
                 break;
             }
 
+            if (once)
+            {
+                if (feats_undistort_filter->points.size() > 1000)
+                {
+                    once = false;
+                    string file_name = string("scans_1frame.pcd");
+                    string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+                    pcl::PCDWriter pcd_writer;
+                    cout << "current scan saved to /PCD/" << file_name << endl;
+                    pcd_writer.writeBinary(all_points_dir, *feats_undistort_filter);
+                }
+            }
             // publish_effect_world(pubLaserCloudEffect);
             // publish_map(pubLaserCloudMap);
 
@@ -2480,33 +3020,35 @@ int main(int argc, char **argv)
         }
         fclose(fp2);
     }
-    FILE *opt_log_file;
-    double cur_timestamp = omp_get_wtime();
-    std::stringstream ss;
-    ss << std::setprecision(10) << cur_timestamp;
-    string opt_log_dir = root_dir + "/Log/m_opt_log_" + ss.str() + ".txt";
-    ss.clear();
-    opt_log_file = fopen(opt_log_dir.c_str(), "a");
-    fprintf(opt_log_file, "frame end time \t\t N \t opt pix size \t raw proj points \t\t opt rot \t\t opt trans \t\t rot \t\t trans \n");
-    for (int i = 0; i < cache_all_log.size(); i++)
-    {
-        LogVariable temp = cache_all_log[i];
-        Quaterniond opt_q(temp.optTcw.rotation());
-        // Eigen::Vector3d opt_trans = temp.optTcw.translation();
-        Eigen::Vector3d opt_trans = temp.opt_trans;
-        Quaterniond q(temp.origTcw.rotation());
-        // Eigen::Vector3d t = temp.origTcw.translation();
-        Eigen::Vector3d t = temp.trans;
-        V3D opt_euler_rot = QuaternionToEuler(temp.opt_rot);
-        V3D ori_euler_rot = QuaternionToEuler(temp.rot);
+    // FILE *opt_log_file;
+    // double cur_timestamp = omp_get_wtime();
+    // std::stringstream ss;
+    // ss << std::setprecision(10) << cur_timestamp;
+    // string opt_log_dir = root_dir + "/Log/m_opt_log_" + ss.str() + ".txt";
+    // ss.clear();
+    // opt_log_file = fopen(opt_log_dir.c_str(), "a");
+    // fprintf(opt_log_file, "frame end time \t\t N \t opt ratio \t raw ratio \t\t opt rot \t\t opt trans \t\t rot \t\t trans \n");
+    // for (int i = 0; i < cache_all_log.size(); i++)
+    // {
+    //     LogVariable temp = cache_all_log[i];
+    //     Quaterniond opt_q(temp.optTcw.rotation());
+    //     // Eigen::Vector3d opt_trans = temp.optTcw.translation();
+    //     Eigen::Vector3d opt_trans = temp.opt_trans;
+    //     Quaterniond q(temp.origTcw.rotation());
+    //     // Eigen::Vector3d t = temp.origTcw.translation();
+    //     Eigen::Vector3d t = temp.trans;
+    //     V3D opt_euler_rot = QuaternionToEuler(temp.opt_rot);
+    //     V3D ori_euler_rot = QuaternionToEuler(temp.rot);
 
-        // fprintf(opt_log_file, "%0.8f|%d|%d|%d|%f,%f,%f,%f|%f,%f,%f|%f,%f,%f,%f|%f,%f,%f|\n", temp.frame_time, temp.sum_point_size, temp.opt_uv_size,
-        //         temp.valid_size, opt_q.w(), opt_q.x(), opt_q.y(), opt_q.z(), opt_trans(0), opt_trans(1), opt_trans(2), q.w(), q.x(), q.y(), q.z(), t(0), t(1), t(2));
+    //     // fprintf(opt_log_file, "%0.8f|%d|%d|%d|%f,%f,%f,%f|%f,%f,%f|%f,%f,%f,%f|%f,%f,%f|\n", temp.frame_time, temp.sum_point_size, temp.opt_uv_size,
+    //     //         temp.valid_size, opt_q.w(), opt_q.x(), opt_q.y(), opt_q.z(), opt_trans(0), opt_trans(1), opt_trans(2), q.w(), q.x(), q.y(), q.z(), t(0), t(1), t(2));
 
-        fprintf(opt_log_file, "%0.8f|%d \t|%d \t|%d \t|%f,%f,%f|%f,%f,%f|%f,%f,%f|%f,%f,%f|\n", temp.frame_time, temp.sum_point_size, temp.opt_uv_size,
-                temp.valid_size, opt_euler_rot.x(), opt_euler_rot.y(), opt_euler_rot.z(), opt_trans(0), opt_trans(1), opt_trans(2), ori_euler_rot.x(), ori_euler_rot.y(), ori_euler_rot.z(), t(0), t(1), t(2));
-    }
-    fclose(opt_log_file);
-    cout << "current opt vars log saved to" << opt_log_dir << endl;
+    //     fprintf(opt_log_file, "%0.8f|%d \t |%f% \t |%f% \t |%f,%f,%f|%f,%f,%f|%f,%f,%f|%f,%f,%f| \n", temp.frame_time, temp.sum_point_size, temp.opt_ratio,
+    //             temp.ori_ratio, opt_euler_rot.x(), opt_euler_rot.y(), opt_euler_rot.z(), opt_trans(0), opt_trans(1), opt_trans(2), ori_euler_rot.x(), ori_euler_rot.y(), ori_euler_rot.z(), t(0), t(1), t(2));
+    // }
+    // fclose(opt_log_file);
+    // cout << "current opt vars log saved to" << opt_log_dir << endl;
+    //return 0;
+    pthread_exit(NULL);
     return 0;
 }

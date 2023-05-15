@@ -9,6 +9,8 @@ common:
     resolution : 12
     fov : 4
     opt_frame_fn : 6 #frame number which will be optimized in front-end
+    opt_num_in_one_frame : 20 #how many times you want to optimize in one frame
+    backend_opt_pose_num: 20
 
 preprocess:
     lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
@@ -27,13 +29,20 @@ mapping:
     extrinsic_R: [ 1, 0, 0,
                    0, 1, 0,
                    0, 0, 1]
+    cam_lidar_ext: [-0.040507, -0.998998, -0.019029, 0.163793,
+                     0.0388064, 0.0174573, -0.999094, 0.0762877, 
+                     0.998425, -0.0412087, 0.0380603, -0.438607, 
+                     0, 0, 0, 1]
+    cam_intrinsic: [817.846, 0, 1000.37, 
+                    0, 835.075, 551.246, 
+                    0, 0, 1]
 
 publish:
     path_en:  true
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
-    frame_num_to_stop: 1000
+    frame_num_to_stop: 100000
     frame_map_to_save: 200
 
 pcd_save:

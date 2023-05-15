@@ -1,3 +1,4 @@
+#pragma once
 #include <iostream>
 #include <fstream>
 #include <list>
@@ -21,14 +22,11 @@ using namespace std;
 
 class pose_optimize : public BaseUnaryEdge<1, double, VertexSE3Expmap>
 {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-protected:
-    float get_grayscale_by_pixel(float u, float v);
-
 public:
-    pose_optimize(/* args */);
-    pose_optimize(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img);
-
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
+    pose_optimize(/* args */){};
+    //pose_optimize(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img);
+    void set_paras(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img);
     virtual void computeError();
     virtual void linearizeOplus();
     virtual bool read(istream &in){};
@@ -38,6 +36,9 @@ public:
     Eigen::Vector3d m_point;
     double m_fx = 0.0, m_fy = 0.0, m_cx = 0.0, m_cy = 0.0;
     cv::Mat *m_img = nullptr;
+
+protected:
+    float get_grayscale_by_pixel(float u, float v);
 
 protected:
     // vector<Eigen::Vector2f> m_pixel_buffer;

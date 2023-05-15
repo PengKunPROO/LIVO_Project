@@ -17,6 +17,7 @@ Panels:
         - /Odometry1/Odometry1/Covariance1/Position1
         - /Odometry1/Odometry1/Covariance1/Orientation1
         - /MarkerArray1/Namespaces1
+        - /Path2
         - /Odometry2
         - /Odometry2/Shape1
         - /Odometry2/Covariance1
@@ -189,7 +190,7 @@ Visualization Manager:
           Queue Size: 10
           Shape:
             Alpha: 1
-            Axes Length: 1
+            Axes Length: 0.30000001192092896
             Axes Radius: 0.009999999776482582
             Color: 255; 85; 0
             Head Length: 0
@@ -372,7 +373,7 @@ Visualization Manager:
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
-      Color: 239; 41; 41
+      Color: 252; 233; 79
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
@@ -417,7 +418,7 @@ Visualization Manager:
       Queue Size: 10
       Shape:
         Alpha: 1
-        Axes Length: 1
+        Axes Length: 0.30000001192092896
         Axes Radius: 0.009999999776482582
         Color: 204; 51; 204
         Head Length: 0.30000001192092896
@@ -456,7 +457,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 39.78870391845703
+      Distance: 49.194618225097656
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -464,17 +465,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 49.12606430053711
-        Y: 12.623431205749512
-        Z: -22.535430908203125
+        X: 21.80587387084961
+        Y: 8.10457992553711
+        Z: -22.787094116210938
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6147968769073486
+      Pitch: 0.8297968506813049
       Target Frame: global
-      Yaw: 3.307192802429199
+      Yaw: 3.497197389602661
     Saved: ~
 Window Geometry:
   Displays:
@@ -495,4 +496,4 @@ Window Geometry:
     collapsed: true
   Width: 1866
   X: 383
-  Y: 120
+  Y: 157

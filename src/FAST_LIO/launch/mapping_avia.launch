@@ -14,7 +14,7 @@
     <!-- 使用室外 -->
     <param name="filter_size_surf" type="double" value="0.5" />
 	<param name="filter_size_map" type="double" value="0.5" />
-
+    <param name="filter_size_camera_opt" type = "double" value="3" />
 	<param name="cube_side_length" type="double" value="1000" />
 	<param name="runtime_pos_log_enable" type="bool" value="1" />
     <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen" /> 

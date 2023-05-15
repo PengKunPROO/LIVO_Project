@@ -29,6 +29,7 @@ using namespace Eigen;
 
 #define VEC_FROM_ARRAY(v) v[0], v[1], v[2]
 #define MAT_FROM_ARRAY(v) v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]
+#define LIDAR_CAM_VEC_FROM_ARRAY(v) v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],V[9],V[10],V[11],V[12],V[13],V[14],V[15]
 #define CONSTRAIN(v, min, max) ((v > min) ? ((v < max) ? v : max) : min)
 #define ARRAY_FROM_EIGEN(mat) mat.data(), mat.data() + mat.rows() * mat.cols()
 #define STD_VEC_FROM_EIGEN(mat) vector<decltype(mat)::Scalar>(mat.data(), mat.data() + mat.rows() * mat.cols())
@@ -59,9 +60,9 @@ struct LogVariable
 {
 
     LogVariable(double frame_time, int sum_point_size, int opt_uv_size, int valid_size, Eigen::Isometry3d optTcw, Eigen::Isometry3d origTcw,
-                Eigen::Quaterniond rot, Eigen::Vector3d trans, Eigen::Quaterniond opt_rot, Eigen::Vector3d opt_trans)
+                Eigen::Quaterniond rot, Eigen::Vector3d trans, Eigen::Quaterniond opt_rot, Eigen::Vector3d opt_trans,float opt_ratio,float ori_ratio)
         : opt_uv_size(opt_uv_size), optTcw(optTcw), origTcw(origTcw), valid_size(valid_size), sum_point_size(sum_point_size), frame_time(frame_time),
-          rot(rot), trans(trans), opt_rot(opt_rot), opt_trans(opt_trans){};
+          rot(rot), trans(trans), opt_rot(opt_rot), opt_trans(opt_trans),opt_ratio(opt_ratio),ori_ratio(ori_ratio){};
     // 当前帧的时间，以雷达扫描帧结束为记录点
     double frame_time;
     // 当前帧的所有点数
@@ -82,7 +83,65 @@ struct LogVariable
     Eigen::Quaterniond opt_rot;
     // 优化前的相机相对IMU（第一个），即世界坐标的平移
     Eigen::Vector3d opt_trans;
+    //优化后投影的无效点比例
+    float opt_ratio;
+    //优化前投影的无效点比例
+    float ori_ratio;
 };
+
+typedef struct g2oMeasure
+{
+    g2oMeasure(Eigen::Vector3d p, float gray, float weight) : p_lidar(p), grayscale(gray), weight(weight){};
+    g2oMeasure()
+    {
+        p_lidar = Eigen::Vector3d::Zero();
+        grayscale = -1.0;
+        weight = -1.0;
+    };
+    Eigen::Vector3d p_lidar;
+    float grayscale;
+    float weight;
+} goMeas;
+
+// 不能用指针，因为每一帧我们存储的图像，都会因为Measures的改变而改变，所以图像必须用复制
+// g2o那一块可以用指针，因为那个边只会存在一帧，到下一帧就是新的边了
+typedef struct ImgOptimized
+{
+    ImgOptimized()
+    {
+        img_ref = cv::Mat();
+        lidar_img = Eigen::Isometry3d::Identity();
+    };
+    ImgOptimized(cv::Mat img, Eigen::Isometry3d transform) : img_ref(img), lidar_img(transform){};
+    cv::Mat img_ref;
+    // 这里保存的是如何把你用于优化的雷达那一帧坐标系下的点投影到该帧图像上，所以如果你换了其他雷达帧，就得先转到该雷达帧坐标系下再使用
+    // 我现在先把雷达点转到世界坐标，这样优化的就是世界坐标如何转到相机坐标系的总的R了，之后的投影就直接用这个来做
+    Eigen::Isometry3d lidar_img;
+    // //当前帧雷达坐标系在世界坐标的位置和方向
+    // Eigen::Vector3d lidar_pos_w;
+    // Quaterniond lidar_ori_w;
+
+} ImgOpt;
+
+
+typedef struct Pcl_Set{
+    Pcl_Set(PointType point):point(point){};
+    PointType point;
+
+    bool operator <(const Pcl_Set& r_point) const{
+        //只有当被比较的点（要插入的点）不仅在这个范围内且
+        //当该点与红黑树中的点比较距离大于半径，说明两点不相交，此时再判断深度哪个小，如果该点小则留下该点
+        //这里不用三维的原因是深度不应该作为比较的标准，比如有个表面凹凸不平的物体，自然其在y-z是同一个点但是加了x的距离可能就不满足相等的标准了
+        if(sqrt(powl(this->point.y-r_point.point.y,2)+powl(this->point.z-r_point.point.z,2))<0.05f){
+            if(this->point.x<r_point.point.x){
+                return false;
+            }
+        }
+        return (sqrt(powl(this->point.x-r_point.point.x,2)+powl(this->point.y-r_point.point.y,2)+powl(this->point.z-r_point.point.z,2))>=0.05f&&\
+        this->point.x<r_point.point.x);
+    }
+} Pset;
+
 
 struct MeasureGroup // Lidar data and imu dates for the curent process
 {

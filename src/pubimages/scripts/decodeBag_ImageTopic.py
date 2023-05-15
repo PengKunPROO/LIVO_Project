@@ -40,7 +40,7 @@ class ImageCreator():
                 #         cv2.imwrite(depth_path + image_name, cv_image)  #保存；
      
 if __name__ == '__main__':
-    bag_path = '/home/sulab/.ros/2023-03-15-21-53-31.bag'
+    bag_path = '/home/sulab/.ros/2023-05-02-21-11-15.bag'
     #rospy.init_node(PKG)
     try:
         image_creator = ImageCreator(bag_path)
