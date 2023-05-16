@@ -4,6 +4,7 @@
 #include <time.h>
 #include <vector>
 #include <common_lib.h>
+#include <Eigen/StdVector>
 #include "pose_optimize.h"
 
 #include "g2o/core/optimization_algorithm_factory.h"
@@ -16,6 +17,8 @@
 
 class BackendThread
 {
+
+public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 private:
     /* data */
@@ -35,7 +38,7 @@ private:
     Eigen::Matrix3d m_matrixIn_eig;
 
 public:
-    BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, Eigen::Matrix3d matrixIn_eig);
+    BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, const Eigen::Matrix3d& matrixIn_eig);
     ~BackendThread();
 
 public:
@@ -50,23 +53,25 @@ public:
         pthread_mutex_unlock(&opt_finished);
         return finished_flag;
     }
-    vector<Isometry3d> get_opt_pose(){
+    vector<Eigen::Isometry3d,Eigen::aligned_allocator<Eigen::Isometry3d>> get_opt_pose(){
         int size = m_pose_buffer.size();
-        vector<Isometry3d> cache(size);
+        vector<Eigen::Isometry3d,Eigen::aligned_allocator<Eigen::Isometry3d>> cache(size);
         pthread_mutex_lock(&pose_modify);
         for(int i=0;i<size;i++){
             cache[i] = m_pose_buffer[i].lidar_img;
         }
         pthread_mutex_unlock(&pose_modify);
+        return cache;
     }
 };
 
-BackendThread::BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, Eigen::Matrix3d matrixIn_eig)
+BackendThread::BackendThread(vector<ImgOpt> pose_buffer, int opt_num, std::map<int, vector<goMeas>> meas_map, const Eigen::Matrix3d& matrixIn_eig)
 {
     m_pose_buffer = pose_buffer;
     m_meas_map = meas_map;
     m_matrixIn_eig = matrixIn_eig;
     isFinished = false;
+    ROS_ERROR("size of m_pose_buffer:%d || size of m_meas_map:%d",m_pose_buffer.size(),m_meas_map.size());
     startThread();
 }
 
@@ -99,7 +104,7 @@ void BackendThread::stopThread()
 
 bool BackendThread::start_optimize()
 {
-    ROS_WARN("Enter");
+    ROS_WARN("Enter----%ld",(long)pose_backopt_thread);
     typedef g2o::BlockSolver<g2o::BlockSolverTraits<6, 1>> BlockSolverType;
     typedef g2o::LinearSolverDense<BlockSolverType::PoseMatrixType>
         LinearSolverType;
@@ -109,9 +114,9 @@ bool BackendThread::start_optimize()
     g2o::SparseOptimizer optimizer;
     optimizer.setAlgorithm(solver);
     optimizer.setVerbose(true);
-    ROS_WARN("Set Opt");
+    ROS_WARN("Set Opt-----%ld",(long)pose_backopt_thread);
 
-    ROS_WARN("Reset Buffer");
+    ROS_WARN("Reset Buffer-----%ld",(long)pose_backopt_thread);
     int pose_size = m_pose_buffer.size();
     for (int i = 0; i < pose_size; i++)
     {
@@ -125,7 +130,7 @@ bool BackendThread::start_optimize()
 
     int id = 1;
     int no_weight_num;
-    for (int i = 0; i < opt_num; i++)
+    for (int i = 0; i < pose_size; i++)
     {
         for (goMeas m : m_meas_map.at(i))
         {
@@ -149,7 +154,7 @@ bool BackendThread::start_optimize()
             optimizer.addEdge(edge);
         }
     }
-    ROS_ERROR("BACKEND-------Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!", optimizer.edges().size());
+    ROS_ERROR("BACKEND-------Edges in graph: %lu !!!!!!!!!!!!!!!!!!!!!!!!!--------%ld", optimizer.edges().size(),(long)pose_backopt_thread);
 
     optimizer.initializeOptimization();
     optimizer.optimize(opt_num); // 可以指定优化步数
@@ -165,7 +170,7 @@ bool BackendThread::start_optimize()
     pthread_mutex_lock(&opt_finished);
     isFinished = true;
     pthread_mutex_unlock(&opt_finished);
-    pthread_yield();
+    return true;
 }
 
 void *BackendThread::multi_thread_ptr(void *arg)

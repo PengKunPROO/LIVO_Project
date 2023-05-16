@@ -72,6 +72,7 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <map>
 #include <thread>
+#include <sys/time.h>
 
 #include "g2o/core/optimization_algorithm_factory.h"
 #include "g2o/core/sparse_optimizer.h"
@@ -80,6 +81,8 @@
 #include "g2o/core/base_vertex.h"
 #include "g2o/core/robust_kernel_impl.h"
 #include <g2o/types/slam3d/types_slam3d.h>
+
+#include <Eigen/StdVector>
 
 #define INIT_TIME (0.1)
 #define LASER_POINT_COV (0.001)
@@ -94,15 +97,11 @@ typedef struct imgStruct
     double timestamp;
 } ImgStore;
 
-
-
 typedef struct g2oBackendMeasure
 {
-    g2oBackendMeasure(Eigen::Isometry3d trans) : f_f_trans(trans){};
+    g2oBackendMeasure(const Eigen::Isometry3d &trans) : f_f_trans(trans){};
     Eigen::Isometry3d f_f_trans;
 } goBM;
-
-
 
 // 存的是我们在插值部分计算的每一帧从当前帧转到产生错位的img对应的lidar坐标系的位姿，每一帧都更新
 Eigen::Isometry3d lidar_OptLidar;
@@ -156,6 +155,8 @@ bool scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 
 bool imgChanged = true;
 double simulate_time_lidar = 0.0;
+double whole_time_one_frame = 0.0f;
+double whole_time_one_frame_start = 0.0f;
 
 int row, col;
 
@@ -189,11 +190,12 @@ deque<ImgOpt *> multi_opt_buffer;
 deque<cv::Mat> img_optimize_buffer;
 // 当缓存了20帧就开始优化
 map<int, vector<ImgOpt *>> backend_opt_map;
+vector<ImgOpt *> backend_buffer;
 
 ImgStore srcImg;
 vector<vector<int>> color_vector;
 vector<goMeas> opt_meas_buffer;
-vector<BackendThread*> backend_opt_slider;
+vector<BackendThread *> backend_opt_slider;
 cv::Mat matrix_in;
 cv::Mat matrix_out;
 // cv::Mat camera_matrix;
@@ -1947,7 +1949,6 @@ Eigen::Isometry3d optimize_photometric(int index)
             float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &multi_opt_buffer[j]->img_ref);
             if (gray_temp == -1.0)
             {
-                ROS_ERROR("Wrong Projection! Skip!");
                 continue;
             }
             opt_meas_buffer.push_back(g2oMeasure(point_world, gray_temp, -1.0));
@@ -2314,9 +2315,11 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
     for (int i = 0; i < backend_opt_pose_num; i++)
     {
         vector<goMeas> temp;
-        for (int j = 0; j < filter_size; j++)
+        for (int j = 0; j < filter_size/3; j++)
         {
-            Eigen::Vector3d point_world(laserCloudWorld->points[j].x, laserCloudWorld->points[j].y, laserCloudWorld->points[j].z);
+            std::srand((int)time(0));
+            int random_index = std::rand()%(filter_size);
+            Eigen::Vector3d point_world(laserCloudWorld->points[random_index].x, laserCloudWorld->points[random_index].y, laserCloudWorld->points[random_index].z);
             float weight = 0;
             vector<goMeas> temp_meas_buffer;
             for (int k = 0; k < backend_opt_pose_num; k++)
@@ -2330,7 +2333,6 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
                 float gray_temp = getGrayScaleInImg(pixels(0), pixels(1), &backend_buffer[k]->img_ref);
                 if (gray_temp == -1.0)
                 {
-                    ROS_ERROR("Wrong Projection! Skip!");
                     continue;
                 }
                 // 以点是否与优化帧共视作为权重
@@ -2348,14 +2350,15 @@ void pose_opt_backend(vector<ImgOpt *> backend_buffer, const ros::Publisher &odo
         ROS_WARN("Push %d-th frame mease in buffer,continue! --------%lu", i, temp.size());
         meas_map.insert(std::pair<int, vector<goMeas>>(i, temp));
     }
-    //这个变量原本的意义到这里已经用不上了，所以直接赋值，重复利用
+    // 这个变量原本的意义到这里已经用不上了，所以直接赋值，重复利用
     filter_size = backend_buffer.size();
-    //为了多线程，必须让该对象里面的所有用于优化的数据都是自含的，不然主线程很有可能发生内存泄漏
+    // 为了多线程，必须让该对象里面的所有用于优化的数据都是自含的，不然主线程很有可能发生内存泄漏
     vector<ImgOpt> pose_opt_copy(filter_size);
-    for(int i=0;i<filter_size;i++){
-        pose_opt_copy[i] = ImgOpt(backend_buffer[i]->img_ref.clone(),backend_buffer[i]->lidar_img);
+    for (int i = 0; i < filter_size; i++)
+    {
+        pose_opt_copy[i] = ImgOpt(backend_buffer[i]->img_ref.clone(), backend_buffer[i]->lidar_img);
     }
-    BackendThread* be_pose_opt = new BackendThread(pose_opt_copy,backend_opt_pose_num,meas_map,matrixIn_eig);
+    BackendThread *be_pose_opt = new BackendThread(pose_opt_copy, opt_num_in_one_frame, meas_map, matrixIn_eig);
     backend_opt_slider.push_back(be_pose_opt);
 }
 
@@ -2539,6 +2542,10 @@ int main(int argc, char **argv)
     bool status = ros::ok();
     int index_stop = 0;
     bool once = true;
+    whole_time_one_frame_start = omp_get_wtime();
+    struct timeval tv_start,tv_end;
+    gettimeofday(&tv_start,nullptr);
+
     while (status)
     {
         if (flg_exit)
@@ -2706,7 +2713,7 @@ int main(int argc, char **argv)
                 publish_frame_body_rgb(pubLaserCloudFull_body_rgb);
             }
             // 声明成临时变量了，因为多线程情况一个while循环的时间执行不了20帧的后端优化
-            vector<ImgOpt *> backend_buffer;
+
             // 当帧数小于opt_frame_fn时采用两两之间优化，当达到时采用所有的一起优化
             Eigen::Isometry3d lidar_cams;
             if (multi_opt_buffer.size() <= opt_frame_fn && multi_opt_buffer.size() > 1)
@@ -2735,12 +2742,13 @@ int main(int argc, char **argv)
                     delete multi_opt_buffer.front();
                     multi_opt_buffer.front() = nullptr;
                     multi_opt_buffer.pop_front();
+                    ROS_WARN("pop front pose,size -----%d", multi_opt_buffer.size());
                 }
 
                 if (backend_buffer.size() >= backend_opt_pose_num)
                 {
                     ROS_WARN("Backend Opt Start!");
-                    
+
                     pose_opt_backend(backend_buffer, pubOdomAftMapped_cam, pubPath_camera);
                     release_vector_with_pointer(backend_buffer);
                     vector<ImgOpt *>().swap(backend_buffer);
@@ -2751,24 +2759,35 @@ int main(int argc, char **argv)
                 ROS_WARN("no need to opt,opt paras are not enough!");
             }
             ROS_WARN("opti END!");
-            for(int i=0;i<backend_opt_slider.size();i++){
-                if(backend_opt_slider[i]->is_finished()){
-                    vector<Isometry3d> cache_pose = backend_opt_slider[i]->get_opt_pose();
+            for (int i = 0; i < backend_opt_slider.size(); i++)
+            {
+                if (backend_opt_slider[i]->is_finished())
+                {
+                    ROS_WARN("one is finished!!!");
+                    vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> cache_pose = backend_opt_slider[i]->get_opt_pose();
                     int size = cache_pose.size();
-                    for(int j=0;j<size;j++){
-                        publish_odometry_camera_backend(pubOdomAftMapped_cam,cache_pose[j]);
+                    for (int j = 0; j < size; j++)
+                    {
+                        publish_odometry_camera_backend(pubOdomAftMapped_cam, cache_pose[j]);
                         publish_path_interpolate_backend(pubPath_camera, cache_pose[j]);
                     }
                     delete backend_opt_slider[i];
                     backend_opt_slider[i] = nullptr;
                 }
+                else
+                {
+                    ROS_WARN("No one is finished!!!");
+                }
             }
-            vector<BackendThread*>::iterator iter_be_slider = backend_opt_slider.begin();
-            while(iter_be_slider!=backend_opt_slider.end()){
-                if((*iter_be_slider)==nullptr){
+            vector<BackendThread *>::iterator iter_be_slider = backend_opt_slider.begin();
+            while (iter_be_slider != backend_opt_slider.end())
+            {
+                if ((*iter_be_slider) == nullptr)
+                {
                     iter_be_slider = backend_opt_slider.erase(iter_be_slider);
                 }
-                else{
+                else
+                {
                     iter_be_slider++;
                 }
             }
@@ -2787,9 +2806,10 @@ int main(int argc, char **argv)
             getOriginalCoordByTransMatrix(ei_q, ei_t, before_opt_Tcw);
             LogVariable cur_frame_log = LogVariable(Measures.lidar_end_time, cloudRGBTemp->points.size(), invalid_count, valid_orig_count, optTcw, origTcw,
                                                     ei_q, ei_t, opt_ei_q, opt_ei_t, after_opt_valid_ratio, before_opt_valid_ratio);
-            // cache_all_log.push_back(cur_frame_log);
+            cache_all_log.push_back(cur_frame_log);
             //
             //
+            
             index_stop++;
             if (index_stop >= frame_num_to_stop)
             {
@@ -2846,6 +2866,37 @@ int main(int argc, char **argv)
         status = ros::ok();
         rate.sleep();
     }
+    gettimeofday(&tv_end,nullptr);
+    whole_time_one_frame = omp_get_wtime();
+    while (1)
+    {
+        vector<BackendThread *>::iterator iter = backend_opt_slider.begin();
+        while (iter != backend_opt_slider.end())
+        {
+            if (!(*iter)->is_finished())
+            {
+                iter++;
+            }
+            else
+            {
+                ROS_WARN("PUB!");
+                vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> cache_pose = (*iter)->get_opt_pose();
+                int size = cache_pose.size();
+                for (int j = 0; j < size; j++)
+                {
+                    publish_odometry_camera_backend(pubOdomAftMapped_cam, cache_pose[j]);
+                    publish_path_interpolate_backend(pubPath_camera, cache_pose[j]);
+                }
+                delete (*iter);
+                (*iter) = nullptr;
+                iter = backend_opt_slider.erase(iter);
+            }
+        }
+        if(backend_opt_slider.size()==0){
+            ROS_WARN("ALL POSES HAVE BEEN OPT!");
+            break;
+        }
+    }
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
@@ -2899,35 +2950,35 @@ int main(int argc, char **argv)
         }
         fclose(fp2);
     }
-    // FILE *opt_log_file;
-    // double cur_timestamp = omp_get_wtime();
-    // std::stringstream ss;
-    // ss << std::setprecision(10) << cur_timestamp;
-    // string opt_log_dir = root_dir + "/Log/m_opt_log_" + ss.str() + ".txt";
-    // ss.clear();
-    // opt_log_file = fopen(opt_log_dir.c_str(), "a");
-    // fprintf(opt_log_file, "frame end time \t\t N \t opt ratio \t raw ratio \t\t opt rot \t\t opt trans \t\t rot \t\t trans \n");
-    // for (int i = 0; i < cache_all_log.size(); i++)
-    // {
-    //     LogVariable temp = cache_all_log[i];
-    //     Quaterniond opt_q(temp.optTcw.rotation());
-    //     // Eigen::Vector3d opt_trans = temp.optTcw.translation();
-    //     Eigen::Vector3d opt_trans = temp.opt_trans;
-    //     Quaterniond q(temp.origTcw.rotation());
-    //     // Eigen::Vector3d t = temp.origTcw.translation();
-    //     Eigen::Vector3d t = temp.trans;
-    //     V3D opt_euler_rot = QuaternionToEuler(temp.opt_rot);
-    //     V3D ori_euler_rot = QuaternionToEuler(temp.rot);
+    FILE *opt_log_file;
+    double cur_timestamp = omp_get_wtime();
+    std::stringstream ss;
+    ss << std::setprecision(10) << cur_timestamp;
+    string opt_log_dir = root_dir + "/Log/m_opt_log_" + ss.str() + ".txt";
+    ss.clear();
+    opt_log_file = fopen(opt_log_dir.c_str(), "a");
+    fprintf(opt_log_file, "true time \t\t frame end time \t\t N \t opt ratio \t raw ratio \t\t opt rot \t\t opt trans \t\t rot \t\t trans \n");
+    for (int i = 0; i < cache_all_log.size(); i++)
+    {
+        LogVariable temp = cache_all_log[i];
+        Quaterniond opt_q(temp.optTcw.rotation());
+        // Eigen::Vector3d opt_trans = temp.optTcw.translation();
+        Eigen::Vector3d opt_trans = temp.opt_trans;
+        Quaterniond q(temp.origTcw.rotation());
+        // Eigen::Vector3d t = temp.origTcw.translation();
+        Eigen::Vector3d t = temp.trans;
+        V3D opt_euler_rot = QuaternionToEuler(temp.opt_rot);
+        V3D ori_euler_rot = QuaternionToEuler(temp.rot);
 
-    //     // fprintf(opt_log_file, "%0.8f|%d|%d|%d|%f,%f,%f,%f|%f,%f,%f|%f,%f,%f,%f|%f,%f,%f|\n", temp.frame_time, temp.sum_point_size, temp.opt_uv_size,
-    //     //         temp.valid_size, opt_q.w(), opt_q.x(), opt_q.y(), opt_q.z(), opt_trans(0), opt_trans(1), opt_trans(2), q.w(), q.x(), q.y(), q.z(), t(0), t(1), t(2));
+        // fprintf(opt_log_file, "%0.8f|%d|%d|%d|%f,%f,%f,%f|%f,%f,%f|%f,%f,%f,%f|%f,%f,%f|\n", temp.frame_time, temp.sum_point_size, temp.opt_uv_size,
+        //         temp.valid_size, opt_q.w(), opt_q.x(), opt_q.y(), opt_q.z(), opt_trans(0), opt_trans(1), opt_trans(2), q.w(), q.x(), q.y(), q.z(), t(0), t(1), t(2));
 
-    //     fprintf(opt_log_file, "%0.8f|%d \t |%f% \t |%f% \t |%f,%f,%f|%f,%f,%f|%f,%f,%f|%f,%f,%f| \n", temp.frame_time, temp.sum_point_size, temp.opt_ratio,
-    //             temp.ori_ratio, opt_euler_rot.x(), opt_euler_rot.y(), opt_euler_rot.z(), opt_trans(0), opt_trans(1), opt_trans(2), ori_euler_rot.x(), ori_euler_rot.y(), ori_euler_rot.z(), t(0), t(1), t(2));
-    // }
-    // fclose(opt_log_file);
-    // cout << "current opt vars log saved to" << opt_log_dir << endl;
-    //return 0;
+        fprintf(opt_log_file, "%0.8f|%0.8f|%d \t |%f% \t |%f% \t |%f,%f,%f|%f,%f,%f|%f,%f,%f|%f,%f,%f| \n", tv_end.tv_sec-tv_start.tv_sec,temp.frame_time, temp.sum_point_size, temp.opt_ratio,
+                temp.ori_ratio, opt_euler_rot.x(), opt_euler_rot.y(), opt_euler_rot.z(), opt_trans(0), opt_trans(1), opt_trans(2), ori_euler_rot.x(), ori_euler_rot.y(), ori_euler_rot.z(), t(0), t(1), t(2));
+    }
+    fclose(opt_log_file);
+    cout << "current opt vars log saved to" << opt_log_dir << endl;
+    // return 0;
     pthread_exit(NULL);
     return 0;
 }

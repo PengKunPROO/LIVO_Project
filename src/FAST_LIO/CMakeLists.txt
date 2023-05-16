@@ -62,6 +62,7 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(G2O REQUIRED)
+
 set(G2O_LIBS 
     g2o_core g2o_types_sba g2o_solver_csparse g2o_stuff g2o_csparse_extension g2o_types_slam3d
 )
