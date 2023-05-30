@@ -1,3 +1,4 @@
+#pragma once
 #ifndef COMMON_LIB_H
 #define COMMON_LIB_H
 
@@ -5,6 +6,7 @@
 #include <Eigen/Eigen>
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
 #include <fast_lio/Pose6D.h>
 #include <sensor_msgs/Imu.h>
 #include <nav_msgs/Odometry.h>
@@ -35,30 +37,29 @@ using namespace Eigen;
 #define STD_VEC_FROM_EIGEN(mat) vector<decltype(mat)::Scalar>(mat.data(), mat.data() + mat.rows() * mat.cols())
 #define DEBUG_FILE_DIR(name) (string(string(ROOT_DIR) + "Log/" + name))
 
-typedef fast_lio::Pose6D Pose6D;
-typedef pcl::PointXYZINormal PointType;
-typedef pcl::PointCloud<PointType> PointCloudXYZI;
-typedef pcl::PointXYZRGB PointTypeRGB;
-typedef pcl::PointCloud<PointTypeRGB> PointCloudXYZRGB;
-typedef vector<PointType, Eigen::aligned_allocator<PointType>> PointVector;
-typedef Vector3d V3D;
-typedef Matrix3d M3D;
-typedef Vector3f V3F;
-typedef Matrix3f M3F;
 
 #define MD(a, b) Matrix<double, (a), (b)>
 #define VD(a) Matrix<double, (a), 1>
 #define MF(a, b) Matrix<float, (a), (b)>
 #define VF(a) Matrix<float, (a), 1>
 
-M3D Eye3d(M3D::Identity());
-M3F Eye3f(M3F::Identity());
-V3D Zero3d(0, 0, 0);
-V3F Zero3f(0, 0, 0);
+typedef fast_lio::Pose6D Pose6D;
+typedef pcl::PointXYZINormal PointType;
+typedef pcl::PointCloud<PointType> PointCloudXYZI;
+typedef pcl::PointXYZRGB PointTypeRGB;
+typedef pcl::PointCloud<PointTypeRGB> PointCloudXYZRGB;
+typedef vector<PointType, Eigen::aligned_allocator<PointType>> PointVector;
+
+
+typedef Vector3d V3D;
+typedef Matrix3d M3D;
+typedef Vector3f V3F;
+typedef Matrix3f M3F;
+
+
 
 struct LogVariable
 {
-
     LogVariable(double frame_time, int sum_point_size, int opt_uv_size, int valid_size, Eigen::Isometry3d optTcw, Eigen::Isometry3d origTcw,
                 Eigen::Quaterniond rot, Eigen::Vector3d trans, Eigen::Quaterniond opt_rot, Eigen::Vector3d opt_trans,float opt_ratio,float ori_ratio)
         : opt_uv_size(opt_uv_size), optTcw(optTcw), origTcw(origTcw), valid_size(valid_size), sum_point_size(sum_point_size), frame_time(frame_time),
@@ -89,7 +90,18 @@ struct LogVariable
     float ori_ratio;
 };
 
-typedef struct g2oMeasure
+
+struct pointWeightLog{
+    pointWeightLog(double weight,int co_num,double var,std::vector<double> co_array):weight(weight),co_visible_num(co_num),variance(var),co_gray_array(co_array)
+    {};
+    double weight;
+    int co_visible_num;
+    double variance;
+    std::vector<double> co_gray_array;
+};
+
+
+struct g2oMeasure
 {
     g2oMeasure(Eigen::Vector3d p, float gray, float weight) : p_lidar(p), grayscale(gray), weight(weight){};
     g2oMeasure()
@@ -101,16 +113,19 @@ typedef struct g2oMeasure
     Eigen::Vector3d p_lidar;
     float grayscale;
     float weight;
-} goMeas;
+} ;
 
 // 不能用指针，因为每一帧我们存储的图像，都会因为Measures的改变而改变，所以图像必须用复制
 // g2o那一块可以用指针，因为那个边只会存在一帧，到下一帧就是新的边了
-typedef struct ImgOptimized
+struct ImgOptimized
 {
     ImgOptimized()
     {
         img_ref = cv::Mat();
         lidar_img = Eigen::Isometry3d::Identity();
+    };
+    ~ImgOptimized(){
+        img_ref.release();
     };
     ImgOptimized(cv::Mat img, Eigen::Isometry3d transform) : img_ref(img), lidar_img(transform){};
     cv::Mat img_ref;
@@ -121,10 +136,10 @@ typedef struct ImgOptimized
     // Eigen::Vector3d lidar_pos_w;
     // Quaterniond lidar_ori_w;
 
-} ImgOpt;
+};
 
 
-typedef struct Pcl_Set{
+struct Pcl_Set{
     Pcl_Set(PointType point):point(point){};
     PointType point;
 
@@ -140,7 +155,7 @@ typedef struct Pcl_Set{
         return (sqrt(powl(this->point.x-r_point.point.x,2)+powl(this->point.y-r_point.point.y,2)+powl(this->point.z-r_point.point.z,2))>=0.05f&&\
         this->point.x<r_point.point.x);
     }
-} Pset;
+};
 
 
 struct MeasureGroup // Lidar data and imu dates for the curent process
@@ -170,11 +185,11 @@ struct StatesGroup
     StatesGroup()
     {
         this->rot_end = M3D::Identity();
-        this->pos_end = Zero3d;
-        this->vel_end = Zero3d;
-        this->bias_g = Zero3d;
-        this->bias_a = Zero3d;
-        this->gravity = Zero3d;
+        this->pos_end = V3D(0,0,0);
+        this->vel_end = V3D(0,0,0);
+        this->bias_g = V3D(0,0,0);
+        this->bias_a = V3D(0,0,0);
+        this->gravity = V3D(0,0,0);
         this->cov = MD(DIM_STATE, DIM_STATE)::Identity() * INIT_COV;
         this->cov.block<9, 9>(9, 9) = MD(9, 9)::Identity() * 0.00001;
     };
@@ -242,8 +257,8 @@ struct StatesGroup
     void resetpose()
     {
         this->rot_end = M3D::Identity();
-        this->pos_end = Zero3d;
-        this->vel_end = Zero3d;
+        this->pos_end = V3D(0,0,0);
+        this->vel_end = V3D(0,0,0);
     }
 
     M3D rot_end;                              // the estimated attitude (rotation matrix) at the end lidar point
@@ -320,15 +335,10 @@ bool esti_normvector(Matrix<T, 3, 1> &normvec, const PointVector &point, const T
     return true;
 }
 
-float calc_dist(PointType p1, PointType p2)
-{
-    float d = (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) + (p1.z - p2.z) * (p1.z - p2.z);
-    return d;
-}
+
 
 template <typename T>
-bool esti_plane(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold)
-{
+bool esti_plane(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &threshold){
     Matrix<T, NUM_MATCH_POINTS, 3> A;
     Matrix<T, NUM_MATCH_POINTS, 1> b;
     A.setZero();
@@ -360,5 +370,15 @@ bool esti_plane(Matrix<T, 4, 1> &pca_result, const PointVector &point, const T &
     }
     return true;
 }
+inline float calc_dist(PointType p1, PointType p2){
+    float d = (p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y) + (p1.z - p2.z) * (p1.z - p2.z);
+    return d;
+}
+
+typedef struct pointWeightLog poWeightL;
+typedef struct g2oMeasure goMeas;
+typedef struct ImgOptimized ImgOpt;
+typedef struct Pcl_Set Pset;
+
 
 #endif

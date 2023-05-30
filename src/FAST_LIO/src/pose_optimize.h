@@ -26,7 +26,7 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
     pose_optimize(/* args */){};
     //pose_optimize(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img);
-    void set_paras(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img);
+    void set_paras(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat& img);
     virtual void computeError();
     virtual void linearizeOplus();
     virtual bool read(istream &in){};
@@ -35,7 +35,7 @@ public:
 public:
     Eigen::Vector3d m_point;
     double m_fx = 0.0, m_fy = 0.0, m_cx = 0.0, m_cy = 0.0;
-    cv::Mat *m_img = nullptr;
+    cv::Mat m_img;
 
 protected:
     float get_grayscale_by_pixel(float u, float v);

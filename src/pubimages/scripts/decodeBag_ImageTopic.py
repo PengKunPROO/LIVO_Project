@@ -13,7 +13,7 @@ from cv_bridge import CvBridgeError
 #import os
 #import sys
      
-rgb_path = '/home/sulab/image_cache/'   #已经建立好的存储rgb彩色图文件的目录
+rgb_path = '/home/sulab/image_cache/test_front_train_station/'   #已经建立好的存储rgb彩色图文件的目录
      
 class ImageCreator():
     def __init__(self,bag_path):
@@ -40,7 +40,7 @@ class ImageCreator():
                 #         cv2.imwrite(depth_path + image_name, cv_image)  #保存；
      
 if __name__ == '__main__':
-    bag_path = '/home/sulab/.ros/2023-05-02-21-11-15.bag'
+    bag_path = '/opt/test_front_train_station.bag'
     #rospy.init_node(PKG)
     try:
         image_creator = ImageCreator(bag_path)

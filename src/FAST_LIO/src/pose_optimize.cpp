@@ -1,6 +1,6 @@
 #include "pose_optimize.h"
 
-void pose_optimize::set_paras(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat *img)
+void pose_optimize::set_paras(Eigen::Vector3d Point3d, double fx, double fy, double cx, double cy, cv::Mat& img)
 {
     m_fx = fx;
     m_fy = fy;
@@ -22,7 +22,7 @@ void pose_optimize::computeError()
     double u = m_fx * point_in_cam.x() / point_in_cam.z() + m_cx;
     double v = m_fy * point_in_cam.y() / point_in_cam.z() + m_cy;
 
-    if (u - 4 < 0 || (u + 4) > m_img->cols || (v - 4) < 0 || (v + 4) > m_img->rows)
+    if (u - 4 < 0 || (u + 4) > m_img.cols || (v - 4) < 0 || (v + 4) > m_img.rows)
     {
         _error(0, 0) = 0.0;
         // when this edge's level is set to 1,g2o won't compute this edge
@@ -86,39 +86,12 @@ void pose_optimize::linearizeOplus()
 
 inline float pose_optimize::get_grayscale_by_pixel(float u, float v)
 {
-    // if(u<=0||v<=0||u>m_img->cols||v>m_img->rows){
-    //     std::cout<<"ROWS: "<<m_img->rows<<std::endl;
-    //     std::cout<<"COLS: "<<m_img->cols<<std::endl;
-    //     std::cout<<"ERRRRRRRRRRRRRRRRRRRRRRROR"<<std::endl;
-    //     std::cout<<"UU:"<<u<<std::endl;
-    //     std::cout<<"VV:"<<v<<std::endl;
-    // }
-    // // using bilinear interploation
-    // float bbox_min_u = floor(u);
-    // float bbox_min_v = floor(v);
-
-    // // m_pixel_buffer.clear();
-    // // for(int i=0;i<2;i++){
-    // //     for(int j=0;j<2;j++){
-    // //         //存储的顺序是 (u,v) (u,v+1) (u+1,v) (u+1,v+1)
-    // //         m_pixel_buffer.push_back(Eigen::Vector2f(bbox_min_u+i,bbox_min_v+j));
-    // //     }
-    // // }
-
-    // // 没考虑左下角的像素在图像左上角、右上角、右下角的情况
-    // float xx = u - bbox_min_u;
-    // float yy = v - bbox_min_v;
-    // float x_gray_1 = xx * (float)m_img->at<uchar>(bbox_min_u, bbox_min_v) + (1 - xx) * (float)m_img->at<uchar>(bbox_min_u, bbox_min_v + 1);
-    // float x_gray_2 = xx * (float)m_img->at<uchar>(bbox_min_u, bbox_min_v + 1) + (1 - xx) * (float)m_img->at<uchar>(bbox_min_u + 1, bbox_min_v + 1);
-
-    // float y_gray = yy * x_gray_1 + (1 - yy) * x_gray_2;
-    // return y_gray;
-    uchar *data = &m_img->data[int(v) * m_img->step + int(u)];
+    uchar *data = &m_img.data[int(v) * m_img.step + int(u)];
     float xx = u - floor(u);
     float yy = v - floor(v);
     return float(
         (1 - xx) * (1 - yy) * data[0] +
         xx * (1 - yy) * data[1] +
-        (1 - xx) * yy * data[m_img->step] +
-        xx * yy * data[m_img->step + 1]);
+        (1 - xx) * yy * data[m_img.step] +
+        xx * yy * data[m_img.step + 1]);
 }
